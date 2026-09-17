@@ -1,3 +1,5 @@
+use std::ops::BitOr;
+
 pub type ParseFn = fn(&str) -> Option<usize>;
 
 #[derive(Clone, Copy, Debug)]
@@ -16,7 +18,7 @@ pub struct TokenInfo
 	matcher: TokenMatcher,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub struct Token<'a>
 {
     pub token_type: TokenType,
@@ -45,7 +47,7 @@ macro_rules! define_tokens
 		),* $(,)?
 	) =>
 	{
-		#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+		#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
         pub enum TokenType
         {
 			$(
@@ -101,6 +103,16 @@ macro_rules! define_tokens
 					}
 				}
 			}
+
+            pub fn mask(self) -> u32
+            {
+                match self
+                {
+                    $(
+                        Self::$variant => $mask,
+                    )*
+                }
+            }
 		}
 	};
 
@@ -122,20 +134,60 @@ macro_rules! define_tokens
 
 define_tokens!
 {
-	Dflt   => ("default",   1 << 0),
-	Fact   => ("fact",      1 << 1,  "="),
-	Symbol => ("symbol",    1 << 2,  parse_symbol),
-	Then   => ("then",      1 << 3,  "=>"),
-	Iff    => ("iff",       1 << 4,  "<=>"),
-	Cond   => ("condition", 1 << 5),
-	Xor    => ("xor",       1 << 6,  "^"),
-	And    => ("and",       1 << 7,  "+"),
-	Or     => ("or",        1 << 8,  "|"),
-	Not    => ("not",       1 << 9,  "!"),
-	Query  => ("query",     1 << 10, "?"),
-	Lp     => ("(",         1 << 12, "("),
-	Rp     => (")",         1 << 13, ")"),
-	Par    => ("par",       1 << 14),
-	Start  => ("start",     1 << 15),
-	End    => ("end",       1 << 16),
+	Dflt   		=> ("default",      1 << 0),
+	Fact   		=> ("fact",         1 << 1,  "="),
+	Symbol 		=> ("symbol",       1 << 2,  parse_symbol),
+	Then   		=> ("then",         1 << 3,  "=>"),
+	Iff    		=> ("iff",          1 << 4,  "<=>"),
+	Cond   		=> ("condition",    1 << 3 | 1 << 4),
+	Xor    		=> ("xor",          1 << 5,  "^"),
+	And    		=> ("and",          1 << 6,  "+"),
+	Or     		=> ("or",           1 << 7,  "|"),
+	Not    		=> ("not",          1 << 8,  "!"),
+    Operator    => ("operator",     1 << 3 | 1 << 5 | 1 << 6 | 1 << 7 | 1 << 8),
+	Query  		=> ("query",        1 << 9, "?"),
+	Lp     		=> ("(",            1 << 10, "("),
+	Rp     		=> (")",            1 << 11, ")"),
+	Par    		=> ("par",          1 << 10 | 1 << 11),
+	Start  		=> ("start",        1 << 12),
+	End    		=> ("end",          1 << 13),
+}
+
+#[derive(Clone, Copy)]
+pub struct TokenMask(u32);
+
+impl BitOr for TokenType
+{
+    type Output = TokenMask;
+
+    fn bitor(self, rhs: Self) -> Self::Output
+    {
+        TokenMask(self.mask() | rhs.mask())
+    }
+}
+
+impl BitOr<TokenType> for TokenMask
+{
+    type Output = TokenMask;
+
+    fn bitor(self, rhs: TokenType) -> Self::Output
+    {
+        TokenMask(self.0 | rhs.mask())
+    }
+}
+
+impl TokenMask
+{
+    pub fn contains(self, token: TokenType) -> bool
+    {
+        self.0 & token.mask() != 0
+    }
+}
+
+impl From<TokenType> for TokenMask
+{
+    fn from(token: TokenType) -> Self
+    {
+        TokenMask(token.mask())
+    }
 }
