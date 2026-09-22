@@ -1,4 +1,4 @@
-use std::ops::BitOr;
+use std::ops::{BitOr, BitAnd};
 
 pub type ParseFn = fn(&str) -> Option<usize>;
 
@@ -163,6 +163,16 @@ impl BitOr for TokenType
     fn bitor(self, rhs: Self) -> Self::Output
     {
         TokenMask(self.mask() | rhs.mask())
+    }
+}
+
+impl BitAnd for TokenType
+{
+    type Output = bool;
+
+    fn bitand(self, rhs: Self) -> Self::Output
+    {
+        self.mask() & rhs.mask() != 0
     }
 }
 

@@ -2,7 +2,7 @@ use crate::tokenizer::{Token, TokenType, TokenMask};
 use std::collections::HashMap;
 use std::sync::LazyLock;
 
-pub fn grammar_verify_par(tokens: Vec<Token>) -> Result<(), &'static str>
+pub fn verify_par(tokens: &Vec<Token>) -> Result<(), &'static str>
 {
     let mut par_count = 0;
     for token in tokens
@@ -37,7 +37,7 @@ pub fn grammar_verify_par(tokens: Vec<Token>) -> Result<(), &'static str>
     Ok(())
 }
 
-pub fn grammar_verify_conditional_token(tokens: Vec<Token>) -> Result<(), &'static str>
+pub fn verify_conditional_token(tokens: &Vec<Token>) -> Result<(), &'static str>
 {
     let mut cond_token_found = false;
     let mut fact_or_query_token_found = false;
@@ -82,7 +82,7 @@ pub fn grammar_verify_conditional_token(tokens: Vec<Token>) -> Result<(), &'stat
     Ok(())
 }
 
-pub fn grammar_check_fact(tokens: Vec<Token>) -> Result<bool, &'static str>
+pub fn check_fact(tokens: &Vec<Token>) -> Result<bool, &'static str>
 {
     let mut fact_found = false;
     let mut symbols: Vec<char> = vec![];
@@ -117,7 +117,7 @@ pub fn grammar_check_fact(tokens: Vec<Token>) -> Result<bool, &'static str>
     Ok(fact_found)
 }
 
-pub fn grammar_check_query(tokens: Vec<Token>) -> Result<bool, &'static str>
+pub fn check_query(tokens: &Vec<Token>) -> Result<bool, &'static str>
 {
     let mut query_found = false;
     let mut symbols: Vec<char> = vec![];
@@ -208,7 +208,7 @@ static GRAMMAR_MAP: LazyLock<HashMap<TokenType, TokenMask>> = LazyLock::new(||
         )
     });
 
-pub fn grammar_check_rules(tokens: Vec<Token>) -> Result<(), String>
+pub fn check_grammar(tokens: &Vec<Token>) -> Result<(), String>
 {
     let mut current: &Token = tokens.iter().nth(1).unwrap();
     let mut prev: &Token = tokens.iter().nth(0).unwrap();

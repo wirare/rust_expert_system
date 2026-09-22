@@ -2,30 +2,20 @@ use std::fs;
 
 mod lexer;
 mod tokenizer;
-mod grammar_analyzer;
+mod grammar;
 mod system;
 mod ast;
 
-use tokenizer::Token;
+use system::System;
+
+use crate::system::parser;
 
 fn main() -> Result<(), std::io::Error>
 {
     let file = fs::read_to_string("test.txt")?;
     let split: Vec<&str> = file.lines().filter(|line| !line.trim().is_empty()).collect();
-    let tokens: Vec<Vec<Token>> = match split
-        .iter()
-        .map(|str| lexer::lex(str))
-        .collect()
-    {
-        Ok(tokens) => tokens,
-
-        Err(err) =>
-        {
-            eprintln!("Lexer error: {err}");
-            return Ok(());
-        }
-    };
-
-    print!("{:#?}", tokens);
+    let mut system = System::new();
+    let _ =parser(&mut system, split);
+    println!("{:#?}", system);
     Ok(())
 }
