@@ -16,6 +16,5 @@ fn main() -> Result<(), std::io::Error>
     let split: Vec<&str> = file.lines().filter(|line| !line.trim().is_empty()).collect();
     let mut system = System::new();
     let _ =parser(&mut system, split);
-    println!("{:#?}", system);
     Ok(())
 }

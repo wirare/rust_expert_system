@@ -3,14 +3,57 @@ use crate::tokenizer::{Token, TokenType};
 use crate::ast::{ASTNode, rpn, build_ast};
 use crate::lexer;
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
+
+pub type Rule<'a> = ASTNode<'a>;
+type Constraint<'a> = (ASTNode<'a>, HashSet<char>);
 
 #[derive(Debug)]
 pub struct System<'a>
 {
     facts: Vec<char>,
     query: Vec<char>,
-    rules: Vec<ASTNode<'a>>
+    rules: Vec<Rule<'a>>,
+    symbols_state: [ProofState;26],
+    constraints: Vec<Constraint<'a>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ProofState
+{
+    positive: bool,
+    negative: bool,
+}
+
+enum FactState
+{
+    True,
+    False,
+    Undetermined,
+    Contradiction,
+}
+
+impl ProofState
+{
+    fn new(p: bool, n: bool) -> Self
+    {
+        Self
+        {
+            positive: p,
+            negative: n,
+        }
+    }
+
+    fn state(&self) -> FactState
+    {
+        match (self.positive, self.negative)
+        {
+            (false, false) => FactState::False,
+            (false, true) => FactState::False,
+            (true, false) => FactState::True,
+            (true, true) => FactState::Contradiction,
+        }
+    }
 }
 
 impl<'a> System<'a>
@@ -21,16 +64,18 @@ impl<'a> System<'a>
         {
             facts: Vec::new(),
             query: Vec::new(),
-            rules: Vec::new()
+            rules: Vec::new(),
+            symbols_state: [ProofState::new(false, false); 26],
+            constraints: Vec::new(),
         }
     }
 
-    pub fn add_rule(&mut self, rule: ASTNode<'a>)
+    pub fn add_rule(&mut self, rule: Rule<'a>)
     {
         self.rules.push(rule);
     }
 
-    pub fn get_rules(&mut self) -> &Vec<ASTNode<'a>>
+    pub fn get_rules(&self) -> &Vec<Rule<'a>>
     {
         &self.rules
     }
@@ -40,7 +85,7 @@ impl<'a> System<'a>
         self.facts = facts;
     }
 
-    pub fn get_fact(&mut self) -> &Vec<char>
+    pub fn get_fact(&self) -> &Vec<char>
     {
         &self.facts
     }
@@ -50,17 +95,16 @@ impl<'a> System<'a>
         self.query = query;
     }
 
-    pub fn get_query(&mut self) -> &Vec<char>
+    pub fn get_query(&self) -> &Vec<char>
     {
         &self.query
     }
-}
 
-enum FactState
-{
-    True,
-    False,
-    Undetermined,
+    fn can_prove(&self, symbol: char, state: bool) -> bool
+    {
+        
+        false
+    }
 }
 
 fn rewrite_rules<'a, F>(rules: &mut Vec<Vec<Token<'a>>>, rewrite: F)
@@ -227,7 +271,6 @@ pub fn parser<'a>(system: &mut System<'a>, lines: Vec<&'a str>) -> Result<(), St
     };
     
     rewrite_rules(&mut token_list, rewrite_iff);
-    println!("{:#?}", token_list);
     rewrite_rules(&mut token_list, rewrite_and_conclusion);
 
     let mut fact_found = false;

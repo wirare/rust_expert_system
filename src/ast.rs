@@ -1,5 +1,5 @@
-use std::{collections::HashMap, sync::LazyLock};
-use crate::tokenizer::{Token, TokenType};
+use std::{collections::{HashMap, HashSet}, sync::LazyLock};
+use crate::{system::Rule, tokenizer::{Token, TokenType}};
 
 #[derive(Hash, PartialEq)]
 pub enum Assoc
@@ -53,6 +53,60 @@ impl<'a> ASTNode<'a>
             token,
             left: Some(Box::new(left)),
             right: Some(Box::new(right)),
+        }
+    }
+
+    fn contain_symbol(&self, symbol: char) -> bool
+    {
+        if self.token.value.chars().next().unwrap() == symbol
+        {
+            return true;
+        }
+        else
+        {
+            if let Some(left) = &self.left
+            {
+                let res = left.contain_symbol(symbol);
+                if res
+                {
+                    return true;
+                }
+                else
+                {
+                    if let Some(right) = &self.right
+                    {
+                        return right.contain_symbol(symbol);
+                    }
+                }
+            }
+            return false;
+        }
+    }
+
+    fn contain_token_type(&self, ttype: TokenType) -> bool
+    {
+        if self.token.token_type & ttype
+        {
+            return true;
+        }
+        else
+        {
+            if let Some(left) = &self.left
+            {
+                let res = left.contain_token_type(ttype);
+                if res
+                {
+                    return true;
+                }
+                else
+                {
+                    if let Some(right) = &self.right
+                    {
+                        return right.contain_token_type(ttype);
+                    }
+                }
+            }
+            return false;
         }
     }
 }
@@ -188,9 +242,10 @@ pub fn rpn<'a>(tokens: Vec<Token<'a>>) -> Vec<Token<'a>>
 	output
 }
 
-pub fn build_ast<'a>(rpn: Vec<Token<'a>>) -> Result<ASTNode<'a>, String>
+pub fn build_ast<'a>(rpn: Vec<Token<'a>>) -> Result<Rule<'a>, String>
 {
     let mut stack: Vec<ASTNode<'a>> = Vec::new();
+    let mut symbols: HashSet<char> = HashSet::new();
 
     for token in rpn
     {
@@ -199,6 +254,7 @@ pub fn build_ast<'a>(rpn: Vec<Token<'a>>) -> Result<ASTNode<'a>, String>
         if tt == TokenType::Symbol
         {
             stack.push(ASTNode::new(token));
+            symbols.insert(token.value.chars().next().unwrap());
             continue;
         }
 
@@ -232,5 +288,5 @@ pub fn build_ast<'a>(rpn: Vec<Token<'a>>) -> Result<ASTNode<'a>, String>
         return Err("Invalid RPN expression".to_string());
     }
 
-    Ok(stack.pop().unwrap())
+    Ok((stack.pop().unwrap(), symbols))
 }
