@@ -1,5 +1,5 @@
 use std::{collections::{HashMap, HashSet}, sync::LazyLock};
-use crate::{system::Rule, tokenizer::{Token, TokenType}};
+use crate::{system::Rule, tokenizer::{Token, TokenMask, TokenType}};
 
 #[derive(Hash, PartialEq)]
 pub enum Assoc
@@ -56,7 +56,7 @@ impl<'a> ASTNode<'a>
         }
     }
 
-    fn contain_symbol(&self, symbol: char) -> bool
+    pub fn contain_symbol(&self, symbol: char) -> bool
     {
         if self.token.value.chars().next().unwrap() == symbol
         {
@@ -83,9 +83,9 @@ impl<'a> ASTNode<'a>
         }
     }
 
-    fn contain_token_type(&self, ttype: TokenType) -> bool
+    pub fn contain_token_mask(&self, tmask: TokenMask) -> bool
     {
-        if self.token.token_type & ttype
+        if tmask.contains(self.token.token_type)
         {
             return true;
         }
@@ -93,7 +93,7 @@ impl<'a> ASTNode<'a>
         {
             if let Some(left) = &self.left
             {
-                let res = left.contain_token_type(ttype);
+                let res = left.contain_token_mask(tmask);
                 if res
                 {
                     return true;
@@ -102,7 +102,7 @@ impl<'a> ASTNode<'a>
                 {
                     if let Some(right) = &self.right
                     {
-                        return right.contain_token_type(ttype);
+                        return right.contain_token_mask(tmask);
                     }
                 }
             }
@@ -288,5 +288,13 @@ pub fn build_ast<'a>(rpn: Vec<Token<'a>>) -> Result<Rule<'a>, String>
         return Err("Invalid RPN expression".to_string());
     }
 
-    Ok((stack.pop().unwrap(), symbols))
+    let head = stack.pop().unwrap();
+    let right = head.right.as_ref().unwrap();
+    let conc_symbol: HashSet<char> = symbols
+        .iter()
+        .copied()
+        .filter(|s| right.contain_symbol(*s))
+        .collect();
+
+    Ok((head, conc_symbol))
 }

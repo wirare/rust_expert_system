@@ -5,20 +5,25 @@ use crate::lexer;
 
 use std::collections::{HashSet, VecDeque};
 
-pub type Rule<'a> = ASTNode<'a>;
-type Constraint<'a> = (ASTNode<'a>, HashSet<char>);
+pub type Rule<'a> = (ASTNode<'a>, HashSet<char>);
+type Constraint = (u32, (HashSet<char>, ProofState));
 
 #[derive(Debug)]
 pub struct System<'a>
 {
     facts: Vec<char>,
+    facts_filled: bool,
     query: Vec<char>,
+    query_filled: bool,
     rules: Vec<Rule<'a>>,
+    rules_for_symbol: [(Vec<usize>, bool);26],
+    base_state: [ProofState;26],
     symbols_state: [ProofState;26],
-    constraints: Vec<Constraint<'a>>,
+    constraints: Vec<Constraint>,
+    visited: [bool; 26],
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ProofState
 {
     positive: bool,
@@ -48,12 +53,17 @@ impl ProofState
     {
         match (self.positive, self.negative)
         {
-            (false, false) => FactState::False,
+            (false, false) => FactState::Undetermined,
             (false, true) => FactState::False,
             (true, false) => FactState::True,
             (true, true) => FactState::Contradiction,
         }
     }
+}
+
+fn symbol_to_nb(symbol: char) -> usize
+{
+    symbol as usize - 'A' as usize
 }
 
 impl<'a> System<'a>
@@ -63,10 +73,15 @@ impl<'a> System<'a>
         Self
         {
             facts: Vec::new(),
+            facts_filled: false,
             query: Vec::new(),
+            query_filled: false,
             rules: Vec::new(),
+            rules_for_symbol: std::array::from_fn(|_| (Vec::new(), false)),
+            base_state: [ProofState::new(false, false); 26],
             symbols_state: [ProofState::new(false, false); 26],
             constraints: Vec::new(),
+            visited: [false; 26],
         }
     }
 
@@ -80,9 +95,19 @@ impl<'a> System<'a>
         &self.rules
     }
 
-    pub fn set_fact(&mut self, facts: Vec<char>)
+    pub fn set_fact(&mut self, facts: Vec<char>) -> Result<(), String>
     {
+        if self.facts_filled
+        {
+            return Err("Facts are already set".to_string());
+        }
         self.facts = facts;
+        self.facts_filled = true;
+        for fact in &self.facts
+        {
+            self.base_state[symbol_to_nb(*fact)] = ProofState::new(true, false);
+        }
+        Ok(())
     }
 
     pub fn get_fact(&self) -> &Vec<char>
@@ -90,9 +115,15 @@ impl<'a> System<'a>
         &self.facts
     }
 
-    pub fn set_query(&mut self, query: Vec<char>)
+    pub fn set_query(&mut self, query: Vec<char>) -> Result<(), String>
     {
+        if self.query_filled
+        {
+            return Err("Query are already set".to_string());
+        }
         self.query = query;
+        self.query_filled = true;
+        Ok(())
     }
 
     pub fn get_query(&self) -> &Vec<char>
@@ -100,11 +131,86 @@ impl<'a> System<'a>
         &self.query
     }
 
-    fn can_prove(&self, symbol: char, state: bool) -> bool
+    fn set_symbol_state(&mut self, symbol: char, state: ProofState)
     {
-        
-        false
+        self.symbols_state[symbol_to_nb(symbol)] = state;
     }
+
+    fn get_symbol_state(&self, symbol: char) -> ProofState
+    {
+        self.symbols_state[symbol_to_nb(symbol)]
+    }
+
+    fn add_constraint(&mut self, constraint: Constraint)
+    {
+        self.constraints.push(constraint);
+    }
+
+    fn get_constraint_for_symbol(&self, symbol: char) -> Vec<&Constraint>
+    {
+        self.constraints
+            .iter()
+            .filter(|constraint| constraint.1.0.contains(&symbol))
+            .collect()
+    }
+    
+    fn get_rules_for_symbol(&mut self, symbol: char) -> &[usize]
+    {
+        let index = symbol_to_nb(symbol);
+
+        if !self.rules_for_symbol[index].1
+        {
+            self.rules_for_symbol[index].0 = self
+                .rules
+                .iter()
+                .enumerate()
+                .filter_map(|(i, rule)|
+                    {
+                        rule.1
+                            .contains(&symbol)
+                            .then_some(i)
+                    })
+                .collect();
+
+            self.rules_for_symbol[index].1 = true;
+        }
+
+        &self.rules_for_symbol[index].0
+    }
+
+
+/*
+    fn can_prove(&mut self, symbol: char, state: bool) -> Result<bool, String>
+    {
+        let index = symbol_to_nb(symbol);
+
+        if self.visited[index]
+        {
+            return Err(format!("Cycle detected while trying to prove {} state for {}", state, symbol).to_string());
+        }
+
+        self.visited[index] = true;
+
+        let rules_index_to_explore = self.get_rules_for_symbol(symbol).to_vec();
+
+        for rule_idx in rules_index_to_explore
+        {
+            let rule = &self.rules[rule_idx];
+
+            if rule
+                .0
+                .right
+                .as_ref()
+                .unwrap()
+                .contain_token_mask(TokenType::Or | TokenType::Xor)
+            {
+                
+            }
+        }
+
+        Ok(false)
+    }
+*/
 }
 
 fn rewrite_rules<'a, F>(rules: &mut Vec<Vec<Token<'a>>>, rewrite: F)
@@ -297,7 +403,7 @@ pub fn parser<'a>(system: &mut System<'a>, lines: Vec<&'a str>) -> Result<(), St
                 .iter()
                 .map(|token| token.value.chars().next().unwrap())
                 .collect()
-            );
+            )?;
             continue;
         }
         if grammar::check_query(&tokens)?
@@ -312,7 +418,7 @@ pub fn parser<'a>(system: &mut System<'a>, lines: Vec<&'a str>) -> Result<(), St
                 .iter()
                 .map(|token| token.value.chars().next().unwrap())
                 .collect()
-            );
+            )?;
             continue;
         }
 
