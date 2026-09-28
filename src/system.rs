@@ -1,9 +1,11 @@
 use crate::grammar;
+use crate::tokenizer::TokenType::Fact;
 use crate::tokenizer::{Token, TokenType};
 use crate::ast::{ASTNode, rpn, build_ast};
 use crate::lexer;
 
 use std::collections::{HashSet, VecDeque};
+use std::ops::Deref;
 
 pub type Rule<'a> = (ASTNode<'a>, HashSet<char>);
 type Constraint = (u32, (HashSet<char>, ProofState));
@@ -20,7 +22,7 @@ pub struct System<'a>
     base_state: [ProofState;26],
     symbols_state: [ProofState;26],
     constraints: Vec<Constraint>,
-    visited: [bool; 26],
+    visited: Vec<,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -30,12 +32,22 @@ struct ProofState
     negative: bool,
 }
 
+#[derive(PartialEq, Eq, Clone, Copy)]
 enum FactState
 {
     True,
     False,
     Undetermined,
     Contradiction,
+}
+
+#[derive(PartialEq, Eq)]
+enum Operation
+{
+    And,
+    Or,
+    Not,
+    Xor,
 }
 
 impl ProofState
@@ -64,6 +76,21 @@ impl ProofState
 fn symbol_to_nb(symbol: char) -> usize
 {
     symbol as usize - 'A' as usize
+}
+
+impl From<TokenType> for Operation
+{
+	fn from(tt: TokenType) -> Self
+	{
+		match tt
+		{
+			TokenType::Not => Operation::Not,
+			TokenType::And => Operation::And,
+			TokenType::Or => Operation::Or,
+			TokenType::Xor => Operation::Xor,
+			_ => unreachable!(),
+		}
+	}
 }
 
 impl<'a> System<'a>
@@ -178,6 +205,109 @@ impl<'a> System<'a>
         &self.rules_for_symbol[index].0
     }
 
+    fn do_operation(op: Operation, lhs: FactState, rhs: Option<FactState>) -> FactState
+    {
+        if matches!(lhs, FactState::Undetermined | FactState::Contradiction)
+        {
+            return lhs;
+        }
+        if op != Operation::Not && matches!(rhs, Some(FactState::Undetermined) | Some(FactState::Contradiction))
+        {
+            return rhs.unwrap();
+        }
+        match op
+        {
+            Operation::Not =>
+            {
+                match lhs
+                {
+                    FactState::True => FactState::False,
+                    FactState::False => FactState::True,
+                    _ => unreachable!(),
+                }
+            }
+
+            Operation::And =>
+            {
+                if lhs == FactState::True && rhs.unwrap() == FactState::True
+                {
+                    FactState::True
+                }
+                else
+                {
+                    FactState::False
+                }
+            }
+
+            Operation::Or =>
+            {
+                if lhs == FactState::True || rhs.unwrap() == FactState::True
+                {
+                    FactState::True
+                }
+                else
+                {
+                    FactState::False
+                }
+            }
+
+            Operation::Xor => 
+            {
+                if (lhs == FactState::True) ^ (rhs.unwrap() == FactState::True)
+                {
+                    FactState::True
+                }
+                else
+                {
+                    FactState::False
+                }
+            }
+        }
+    }
+
+    fn evaluate_expression_from_ast(&self, exp: &ASTNode) -> FactState
+    {
+        let lhs: FactState;
+        let mut rhs: Option<FactState> = None;
+
+        if exp.token.is_operator()
+        {
+            let left = exp
+                .left
+                .as_deref()
+                .unwrap();
+
+            lhs = self.evaluate_expression_from_ast(left);
+            
+            if exp.token.token_type != TokenType::Not
+            {
+                let right = exp
+                    .right
+                    .as_deref()
+                    .unwrap();
+
+                rhs = Some(self.evaluate_expression_from_ast(right));
+            }
+
+            return System::do_operation(exp.token.token_type.into(), lhs, rhs);
+        }
+        return self
+            .get_symbol_state(exp
+                .token
+                .value
+                .chars()
+                .next()
+                .unwrap())
+            .state();
+    }
+
+    fn evaluate_expression_from_idx(&self, rule_idx: usize) -> FactState
+    {
+        let expression = self.rules[rule_idx].0.left.as_deref().unwrap();
+        self.evaluate_expression_from_ast(expression)
+    }
+
+    
 
 /*
     fn can_prove(&mut self, symbol: char, state: bool) -> Result<bool, String>

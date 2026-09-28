@@ -201,3 +201,11 @@ impl From<TokenType> for TokenMask
         TokenMask(token.mask())
     }
 }
+
+impl<'a> Token<'a>
+{
+    pub fn is_operator(&self) -> bool
+    {
+        self.token_type & TokenType::Operator
+    }
+}
