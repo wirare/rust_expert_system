@@ -1,14 +1,13 @@
 use crate::grammar;
-use crate::tokenizer::TokenType::Fact;
 use crate::tokenizer::{Token, TokenType};
-use crate::ast::{ASTNode, rpn, build_ast};
+use crate::ast::{ASTNode, build_ast, rpn, simplify_and_rewrite_rules};
 use crate::lexer;
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ops::Deref;
 
 pub type Rule<'a> = (ASTNode<'a>, HashSet<char>);
-type Constraint = (u32, (HashSet<char>, ProofState));
+type Constraint = (u32, HashSet<(char, bool)>);
 
 #[derive(Debug)]
 pub struct System<'a>
@@ -22,7 +21,7 @@ pub struct System<'a>
     base_state: [ProofState;26],
     symbols_state: [ProofState;26],
     constraints: Vec<Constraint>,
-    visited: Vec<,
+    visiting: HashSet<(char, FactState)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -32,7 +31,7 @@ struct ProofState
     negative: bool,
 }
 
-#[derive(PartialEq, Eq, Clone, Copy)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash)]
 enum FactState
 {
     True,
@@ -69,6 +68,16 @@ impl ProofState
             (false, true) => FactState::False,
             (true, false) => FactState::True,
             (true, true) => FactState::Contradiction,
+        }
+    }
+
+    fn proves(&self, target: FactState) -> bool
+    {
+        match target
+        {
+            FactState::True => self.positive,
+            FactState::False => self.negative,
+            _ => false,
         }
     }
 }
@@ -108,13 +117,18 @@ impl<'a> System<'a>
             base_state: [ProofState::new(false, false); 26],
             symbols_state: [ProofState::new(false, false); 26],
             constraints: Vec::new(),
-            visited: [false; 26],
+            visiting: HashSet::new(),
         }
     }
 
     pub fn add_rule(&mut self, rule: Rule<'a>)
     {
         self.rules.push(rule);
+    }
+
+    pub fn add_rules(&mut self, rules: Vec<Rule<'a>>)
+    {
+        self.rules = rules;
     }
 
     pub fn get_rules(&self) -> &Vec<Rule<'a>>
@@ -173,11 +187,11 @@ impl<'a> System<'a>
         self.constraints.push(constraint);
     }
 
-    fn get_constraint_for_symbol(&self, symbol: char) -> Vec<&Constraint>
+    fn get_constraint_for_symbol(&self, symbol: char, polarity: bool) -> Vec<&Constraint>
     {
         self.constraints
             .iter()
-            .filter(|constraint| constraint.1.0.contains(&symbol))
+            .filter(|constraint| constraint.1.contains(&(symbol, polarity)))
             .collect()
     }
     
@@ -203,6 +217,18 @@ impl<'a> System<'a>
         }
 
         &self.rules_for_symbol[index].0
+    }
+
+    fn mark_proven(&mut self, symbol: char, target: FactState)
+    {
+        let state = &mut self.symbols_state[symbol_to_nb(symbol)];
+
+        match target
+        {
+            FactState::True => state.positive = true,
+            FactState::False => state.negative = true,
+            _ => unreachable!(),
+        }
     }
 
     fn do_operation(op: Operation, lhs: FactState, rhs: Option<FactState>) -> FactState
@@ -265,7 +291,33 @@ impl<'a> System<'a>
         }
     }
 
-    fn evaluate_expression_from_ast(&self, exp: &ASTNode) -> FactState
+    fn evaluate_symbol(&mut self, symbol: char) -> Result<FactState, String>
+    {
+        let index = symbol_to_nb(symbol);
+
+        let mut positive = self.symbols_state[index].positive;
+        let mut negative = self.symbols_state[index].negative;
+
+        if !positive
+        {
+            positive = self.can_prove(symbol, FactState::True)?;
+        }
+
+        if !negative
+        {
+            negative = self.can_prove(symbol, FactState::False)?;
+        }
+
+        Ok(match (positive, negative)
+            {
+                (true, true) => FactState::Contradiction,
+                (true, false) => FactState::True,
+                (false, true) => FactState::False,
+                (false, false) => FactState::False,
+            })
+    }
+
+    fn evaluate_expression_from_ast(&mut self, exp: &ASTNode) -> Result<FactState, String>
     {
         let lhs: FactState;
         let mut rhs: Option<FactState> = None;
@@ -277,7 +329,7 @@ impl<'a> System<'a>
                 .as_deref()
                 .unwrap();
 
-            lhs = self.evaluate_expression_from_ast(left);
+            lhs = self.evaluate_expression_from_ast(left)?;
             
             if exp.token.token_type != TokenType::Not
             {
@@ -286,208 +338,154 @@ impl<'a> System<'a>
                     .as_deref()
                     .unwrap();
 
-                rhs = Some(self.evaluate_expression_from_ast(right));
+                rhs = Some(self.evaluate_expression_from_ast(right)?);
             }
 
-            return System::do_operation(exp.token.token_type.into(), lhs, rhs);
+            return Ok(System::do_operation(exp.token.token_type.into(), lhs, rhs));
         }
-        return self
-            .get_symbol_state(exp
-                .token
-                .value
-                .chars()
-                .next()
-                .unwrap())
-            .state();
+        let symbol = exp
+            .token
+            .value
+            .chars()
+            .next()
+            .unwrap();
+
+        Ok(self.evaluate_symbol(symbol)?)
     }
 
-    fn evaluate_expression_from_idx(&self, rule_idx: usize) -> FactState
+    fn evaluate_expression_from_idx(&mut self, rule_idx: usize) -> Result<FactState, String>
     {
-        let expression = self.rules[rule_idx].0.left.as_deref().unwrap();
-        self.evaluate_expression_from_ast(expression)
+        let expression = self.rules[rule_idx]
+            .0
+            .left
+            .as_deref()
+            .unwrap()
+            .clone();
+
+        self.evaluate_expression_from_ast(&expression)
     }
 
+    fn conclusion_matches_goal(conclusion: &ASTNode<'a>, symbol: char, target: FactState) -> bool
+    {
+        let token = conclusion.token;
+
+        match target
+        {
+            FactState::True =>
+            {
+                token.token_type == TokenType::Symbol && token.value.chars().next() == Some(symbol)
+            }
+
+            FactState::False =>
+            {
+                if token.token_type != TokenType::Not
+                {
+                    return false;
+                }
+
+                let child_token = conclusion.left.as_deref().unwrap().token;
+
+                child_token.token_type == TokenType::Symbol && child_token.value.chars().next() == Some(symbol)
+            }
+
+            _ => false,
+        }
+    }
     
-
-/*
-    fn can_prove(&mut self, symbol: char, state: bool) -> Result<bool, String>
+    fn can_prove(&mut self, symbol: char, target_state: FactState) -> Result<bool, String>
     {
+        if matches!(target_state, FactState::Undetermined | FactState::Contradiction)
+        {
+            return Err("target_state for can_prove() can only be FactState::{True,False}".to_string());
+        }
+        
         let index = symbol_to_nb(symbol);
 
-        if self.visited[index]
+        if self.symbols_state[index].proves(target_state)
         {
-            return Err(format!("Cycle detected while trying to prove {} state for {}", state, symbol).to_string());
+            return Ok(true);
         }
 
-        self.visited[index] = true;
+        let visiting_key = (symbol, target_state);
 
-        let rules_index_to_explore = self.get_rules_for_symbol(symbol).to_vec();
-
-        for rule_idx in rules_index_to_explore
+        if self.visiting.contains(&visiting_key)
         {
-            let rule = &self.rules[rule_idx];
-
-            if rule
-                .0
-                .right
-                .as_ref()
-                .unwrap()
-                .contain_token_mask(TokenType::Or | TokenType::Xor)
-            {
-                
-            }
+            return Ok(false);
         }
 
-        Ok(false)
-    }
-*/
-}
+        self.visiting.insert(visiting_key);
 
-fn rewrite_rules<'a, F>(rules: &mut Vec<Vec<Token<'a>>>, rewrite: F)
-where
-	F: Fn(&[Token<'a>]) -> Option<Vec<Vec<Token<'a>>>>,
-{
-    let mut pending: VecDeque<Vec<Token<'a>>> = rules.drain(..).collect();
-    let mut result: Vec<Vec<Token<'a>>> = Vec::new();
-
-    while let Some(rule) = pending.pop_front()
-    {
-        if let Some(remplacements) = rewrite(&rule)
-        {
-            for remplacement in remplacements.into_iter().rev()
+        let result = (|| -> Result<bool, String>
             {
-                pending.push_front(remplacement);
-            }
-        }
-        else
-        {
-            result.push(rule);
-        }
-    }
+                let rules_to_visit = self
+                    .get_rules_for_symbol(symbol)
+                    .to_vec();
 
-    *rules = result;
-}
+                for rule_idx in rules_to_visit
+                {
+                    let premise = self.evaluate_expression_from_idx(rule_idx)?;
 
-fn rewrite_iff<'a>(rule: &[Token<'a>]) -> Option<Vec<Vec<Token<'a>>>>
-{
-    let Some(iff_pos) = rule
-        .iter()
-        .position(|token| token.token_type == TokenType::Iff)
-    else
-    {
-        return None;
-    };
+                    match premise
+                    {
+                        FactState::True => {}
 
-    let lhs = &rule[1..iff_pos];
-    let rhs = &rule[iff_pos + 1..rule.len() - 1];
+                        FactState::False | FactState::Undetermined =>
+                        {
+                            continue;
+                        }
 
-    let start = Token
-    {
-        token_type: TokenType::Start,
-        value: "",
-    };
+                        FactState::Contradiction =>
+                        {
+                            return Err(format!("Contradiction while evaluating rule {}", rule_idx));
+                        }
+                    }
+                    
+                    let conclusion = self.rules[rule_idx]
+                        .0
+                        .right
+                        .as_deref()
+                        .unwrap();
 
-    let then = Token
-    {
-        token_type: TokenType::Then,
-        value: "=>",
-    };
+                    match conclusion.token.token_type
+                    {
+                        TokenType::Symbol | TokenType::Not =>
+                        {
+                            let matches_goal = System::conclusion_matches_goal(conclusion, symbol, target_state);
 
-    let end = Token
-    {
-        token_type: TokenType::End,
-        value: "",
-    };
+                            if matches_goal
+                            {
+                                self.mark_proven(symbol, target_state);
+                                return Ok(true);
+                            }
 
-    let mut forward = Vec::new();
+                        }
 
-    forward.push(start);
-    forward.extend_from_slice(lhs);
-    forward.push(then);
-    forward.extend_from_slice(rhs);
-    forward.push(end);
+                        TokenType::Or =>
+                        {
 
-    let mut backward = Vec::new();
+                        }
 
-    backward.push(start);
-    backward.extend_from_slice(rhs);
-    backward.push(then);
-    backward.extend_from_slice(lhs);
-    backward.push(end);
-    
-    Some(vec![forward, backward])
-}
+                        _ => unreachable!()
+                    }
+                }
 
-fn rewrite_and_conclusion<'a>(rule: &[Token<'a>]) -> Option<Vec<Vec<Token<'a>>>>
-{
-    let Some(then_pos) = rule
-        .iter()
-        .position(|token| token.token_type == TokenType::Then)
-    else
-    {
-        return None;
-    };
+                Ok(false)
+            })();
 
-    let mut depth = 0;
-    let mut and_pos = None;
+        self.visiting.remove(&visiting_key);
 
-    for i in then_pos + 1..rule.len() - 1
-    {
-        match rule[i].token_type
-        {
-            TokenType::Lp =>
-            {
-                depth += 1;
-            }
-
-            TokenType::Rp =>
-            {
-                depth -= 1;
-            }
-
-            TokenType::And if depth == 0 =>
-            {
-                and_pos = Some(i);
-                break;
-            }
-
-            _ => {}
-        }
+        result
     }
 
-    let and_pos = and_pos?;
-
-    let then = Token
+    pub fn solve(&mut self)
     {
-        token_type: TokenType::Then,
-        value: "=>",
-    };
-
-    let end = Token
-    {
-        token_type: TokenType::End,
-        value: "",
-    };
-
-    let lhs = &rule[..then_pos];
-
-    let and_lhs = &rule[then_pos + 1..and_pos];
-    let and_rhs = &rule[and_pos + 1..rule.len() - 1];
-
-    let mut first = Vec::new();
-    let mut second = Vec::new();
-
-    first.extend_from_slice(lhs);
-    first.push(then);
-    first.extend_from_slice(and_lhs);
-    first.push(end);
-
-    second.extend_from_slice(lhs);
-    second.push(then);
-    second.extend_from_slice(and_rhs);
-    second.push(end);
-
-    Some(vec![first, second])
+        for symbol in self.query.clone()
+        {
+            self.symbols_state = self.base_state;
+            self.visiting.clear();
+            println!("{}: {:?}", symbol, self.evaluate_symbol(symbol));
+        }
+    }
 }
 
 pub fn parser<'a>(system: &mut System<'a>, lines: Vec<&'a str>) -> Result<(), String>
@@ -505,12 +503,10 @@ pub fn parser<'a>(system: &mut System<'a>, lines: Vec<&'a str>) -> Result<(), St
             return Ok(());
         }
     };
-    
-    rewrite_rules(&mut token_list, rewrite_iff);
-    rewrite_rules(&mut token_list, rewrite_and_conclusion);
 
     let mut fact_found = false;
     let mut query_found = false;
+    let mut asts = Vec::new();
 
     for tokens in &mut token_list
     {
@@ -551,8 +547,10 @@ pub fn parser<'a>(system: &mut System<'a>, lines: Vec<&'a str>) -> Result<(), St
             )?;
             continue;
         }
-
-        system.add_rule(build_ast(rpn(tokens.clone()))?);
+        asts.push(build_ast(rpn(tokens.clone()))?);
     }
+
+    system.add_rules(simplify_and_rewrite_rules(asts));
+
     Ok(())
 }

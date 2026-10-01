@@ -166,7 +166,7 @@ static GRAMMAR_MAP: LazyLock<HashMap<TokenType, TokenMask>> = LazyLock::new(||
                 ),
                 (
                     TokenType::Not,
-                    TokenType::Symbol | TokenType::Lp,
+                    TokenType::Symbol | TokenType::Lp | TokenType::Not,
                 ),
                 (
                     TokenType::Xor,
@@ -186,7 +186,7 @@ static GRAMMAR_MAP: LazyLock<HashMap<TokenType, TokenMask>> = LazyLock::new(||
                 ),
                 (
                     TokenType::Then,
-                    TokenType::Not | TokenType::Symbol,
+                    TokenType::Lp | TokenType::Symbol | TokenType::Not,
                 ),
                 (
                     TokenType::Iff,
@@ -202,7 +202,7 @@ static GRAMMAR_MAP: LazyLock<HashMap<TokenType, TokenMask>> = LazyLock::new(||
                 ),
                 (
                     TokenType::Rp,
-                    TokenType::Cond | TokenType::Or | TokenType::Xor | TokenType::And | TokenType::End,
+                    TokenType::Cond | TokenType::Or | TokenType::Xor | TokenType::And | TokenType::Rp | TokenType::End,
                 ),
             ]
         )

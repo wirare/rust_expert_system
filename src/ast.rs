@@ -1,4 +1,4 @@
-use std::{collections::{HashMap, HashSet}, sync::LazyLock};
+use std::{collections::{HashMap, HashSet, VecDeque}, mem::swap, sync::LazyLock};
 use crate::{system::Rule, tokenizer::{Token, TokenMask, TokenType}};
 
 #[derive(Hash, PartialEq)]
@@ -16,7 +16,7 @@ pub struct OperatorInfo
     pub arity: u8,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ASTNode<'a>
 {
 	pub token: Token<'a>,
@@ -56,58 +56,86 @@ impl<'a> ASTNode<'a>
         }
     }
 
-    pub fn contain_symbol(&self, symbol: char) -> bool
+    pub fn contain_symbol(&self, symbol: char, depth: usize) -> (bool, usize)
     {
         if self.token.value.chars().next().unwrap() == symbol
         {
-            return true;
+            return (true, depth);
         }
         else
         {
             if let Some(left) = &self.left
             {
-                let res = left.contain_symbol(symbol);
-                if res
+                let res = left.contain_symbol(symbol, depth + 1);
+                if res.0
                 {
-                    return true;
+                    return (true, res.1);
                 }
                 else
                 {
                     if let Some(right) = &self.right
                     {
-                        return right.contain_symbol(symbol);
+                        return right.contain_symbol(symbol, depth + 1);
                     }
                 }
             }
-            return false;
+            return (false, depth);
         }
     }
 
-    pub fn contain_token_mask(&self, tmask: TokenMask) -> bool
+    pub fn contain_token_mask(&self, tmask: TokenMask, depth: usize) -> (bool, usize)
     {
         if tmask.contains(self.token.token_type)
         {
-            return true;
+            return (true, depth);
         }
         else
         {
             if let Some(left) = &self.left
             {
-                let res = left.contain_token_mask(tmask);
-                if res
+                let res = left.contain_token_mask(tmask, depth + 1);
+                if res.0
                 {
-                    return true;
+                    return (true, res.1);
                 }
                 else
                 {
                     if let Some(right) = &self.right
                     {
-                        return right.contain_token_mask(tmask);
+                        return right.contain_token_mask(tmask, depth + 1);
                     }
                 }
             }
-            return false;
+            return (false, depth - 1);
         }
+    }
+
+    fn symbols_contained_intern(&self, set: &mut HashSet<char>)
+    {
+        if self.token.token_type == TokenType::Symbol
+        {
+            set.insert(self.token.value.chars().next().unwrap());
+        }
+        else
+        {
+            if self.left.is_some()
+            {
+                self.left.as_ref().unwrap().symbols_contained_intern(set);
+            }
+            if self.right.is_some()
+            {
+                self.right.as_ref().unwrap().symbols_contained_intern(set);
+            }
+        }
+    }
+
+    pub fn symbols_contained(&self) -> HashSet<char>
+    {
+        let mut symbols: HashSet<char> = HashSet::new();
+        
+        self.symbols_contained_intern(&mut symbols);
+
+        symbols
     }
 }
 
@@ -153,6 +181,15 @@ static OP_INFO_MAP: LazyLock<HashMap<TokenType, OperatorInfo>> = LazyLock::new(|
                 ),
                 (
                     TokenType::Then, 
+                    OperatorInfo
+                    {
+                        precedence: 1,
+                        associativity: Assoc::Left,
+                        arity: 2,
+                    }
+                ),
+                (
+                    TokenType::Iff, 
                     OperatorInfo
                     {
                         precedence: 1,
@@ -242,10 +279,9 @@ pub fn rpn<'a>(tokens: Vec<Token<'a>>) -> Vec<Token<'a>>
 	output
 }
 
-pub fn build_ast<'a>(rpn: Vec<Token<'a>>) -> Result<Rule<'a>, String>
+pub fn build_ast<'a>(rpn: Vec<Token<'a>>) -> Result<ASTNode<'a>, String>
 {
     let mut stack: Vec<ASTNode<'a>> = Vec::new();
-    let mut symbols: HashSet<char> = HashSet::new();
 
     for token in rpn
     {
@@ -254,7 +290,6 @@ pub fn build_ast<'a>(rpn: Vec<Token<'a>>) -> Result<Rule<'a>, String>
         if tt == TokenType::Symbol
         {
             stack.push(ASTNode::new(token));
-            symbols.insert(token.value.chars().next().unwrap());
             continue;
         }
 
@@ -289,12 +324,294 @@ pub fn build_ast<'a>(rpn: Vec<Token<'a>>) -> Result<Rule<'a>, String>
     }
 
     let head = stack.pop().unwrap();
-    let right = head.right.as_ref().unwrap();
-    let conc_symbol: HashSet<char> = symbols
-        .iter()
-        .copied()
-        .filter(|s| right.contain_symbol(*s))
-        .collect();
 
-    Ok((head, conc_symbol))
+    Ok(head)
+}
+
+fn split_iff_ast(node: ASTNode) -> [ASTNode; 2]
+{
+    let then_token = Token::new(TokenType::Then, "=>");
+
+    let first_new_node = ASTNode::with_children(then_token, *node.left.clone().unwrap(), *node.right.clone().unwrap());
+    let second_new_node = ASTNode::with_children(then_token, *node.right.clone().unwrap(), *node.left.clone().unwrap());
+
+    [first_new_node, second_new_node]
+}
+
+fn split_and_conc_ast(node: ASTNode) -> [ASTNode; 2]
+{
+    return [*node.left.clone().unwrap(), *node.right.clone().unwrap()];
+}
+
+fn distribute_or_inside_and_exp_in_conc_ast(node: ASTNode) -> ASTNode
+{
+    let and_token = Token::new(TokenType::And, "+");
+    let or_token = Token::new(TokenType::Or, "|");
+    let mut copy = node.clone();
+
+    if copy.left.as_ref().unwrap().token.token_type == TokenType::And
+    {
+        swap(&mut copy.right, &mut copy.left);
+    }
+
+    let node_to_distrib = copy
+        .left
+        .as_deref()
+        .unwrap()
+        .clone();
+
+    let left_node = ASTNode::with_children(
+        or_token,
+        node_to_distrib.clone(),
+        *copy
+        .right
+        .as_ref()
+        .unwrap()
+        .left
+        .as_ref()
+        .unwrap()
+        .clone()
+    );
+
+    let right_node = ASTNode::with_children(
+        or_token, 
+        node_to_distrib, 
+        *copy
+        .right
+        .as_ref()
+        .unwrap()
+        .right
+        .as_ref()
+        .unwrap()
+        .clone()
+    );
+
+    ASTNode::with_children(and_token, left_node, right_node)
+}
+
+fn rewrite_not_or_in_conc_ast(node: ASTNode) -> ASTNode
+{
+    let not_token = Token::new(TokenType::Not, "!");
+    let and_token = Token::new(TokenType::And, "+");
+
+    let left_node = ASTNode::with_child(
+        not_token, 
+        *node
+        .left
+        .as_ref()
+        .unwrap()
+        .left
+        .as_ref()
+        .unwrap()
+        .clone()
+    );
+
+    let right_node = ASTNode::with_child(
+        not_token, 
+        *node
+        .left
+        .as_ref()
+        .unwrap()
+        .right
+        .as_ref()
+        .unwrap()
+        .clone()
+    );
+
+    ASTNode::with_children(and_token, left_node, right_node)
+}
+
+fn rewrite_not_and_in_conc_ast(node: ASTNode) -> ASTNode
+{
+    let not_token = Token::new(TokenType::Not, "!");
+    let or_token = Token::new(TokenType::Or, "|");
+
+    let left_node = ASTNode::with_child(
+        not_token, 
+        *node
+        .left
+        .as_ref()
+        .unwrap()
+        .left
+        .as_ref()
+        .unwrap()
+        .clone()
+    );
+
+    let right_node = ASTNode::with_child(
+        not_token, 
+        *node
+        .left
+        .as_ref()
+        .unwrap()
+        .right
+        .as_ref()
+        .unwrap()
+        .clone()
+    );
+
+    ASTNode::with_children(or_token, left_node, right_node)
+}
+
+fn split_xor_in_conc_ast(node: ASTNode) -> [ASTNode; 2]
+{
+    let not_token = Token::new(TokenType::Not, "!");
+    let or_token = Token::new(TokenType::Or, "|");
+
+    let left_exp_node = node.left.as_ref().unwrap();
+    let right_exp_node = node.right.as_ref().unwrap();
+
+    [
+        ASTNode::with_children(
+            or_token,
+            *left_exp_node.clone(),
+            *right_exp_node.clone(),
+        ),
+        ASTNode::with_children(
+            or_token,
+            ASTNode::with_child(
+                not_token,
+                *left_exp_node.clone()
+            ),
+            ASTNode::with_child(
+                not_token,
+                *right_exp_node.clone()
+            ),
+        ),
+    ]
+}
+
+fn split_not_xor_in_conc_ast(node: ASTNode) -> [ASTNode; 2]
+{
+    let not_token = Token::new(TokenType::Not, "!");
+    let or_token = Token::new(TokenType::Or, "|");
+
+    let xor_node = node.left.as_ref().unwrap();
+    let left_exp_node = xor_node.left.as_ref().unwrap();
+    let right_exp_node = xor_node.right.as_ref().unwrap();
+
+    [
+        ASTNode::with_children(
+            or_token,
+            ASTNode::with_child(
+                not_token,
+                *left_exp_node.clone()
+            ),
+            *right_exp_node.clone(),
+        ),
+        ASTNode::with_children(
+            or_token,
+            *left_exp_node.clone(),
+            ASTNode::with_child(
+                not_token,
+                *right_exp_node.clone()
+            ),
+        ),
+    ]
+}
+
+pub fn simplify_and_rewrite_rules(asts: Vec<ASTNode>) -> Vec<Rule>
+{
+    let mut asts_to_explores: VecDeque<ASTNode> = asts.into();
+    let mut final_asts = Vec::new();
+    let then_token = Token::new(TokenType::Then, "=>");
+
+    while let Some(ast) = asts_to_explores.pop_front()
+    {
+        if ast.token.token_type == TokenType::Iff
+        {
+            asts_to_explores.extend(split_iff_ast(ast));
+            continue;
+        }
+        match ast.right.as_ref().unwrap().token.token_type
+        {
+            TokenType::And =>
+            {
+                let left = ast.left.as_deref().unwrap().clone();
+                let [rule_0, rule_1] = split_and_conc_ast(*ast.right.unwrap());
+                asts_to_explores.push_back(
+                    ASTNode::with_children(then_token, left.clone(), rule_0)
+                );
+                asts_to_explores.push_back(
+                    ASTNode::with_children(then_token, left, rule_1)
+                );
+            }
+
+            TokenType::Or =>
+            {
+                let res = ast.right.as_deref().unwrap().contain_token_mask(TokenType::And.into(), 0);
+                if !res.0 || res.1 != 1
+                {
+                    final_asts.push(ast);
+                    continue;
+                }
+                let left = ast.left.as_deref().unwrap().clone();
+                let right = distribute_or_inside_and_exp_in_conc_ast(*ast.right.unwrap());
+                asts_to_explores.push_back(
+                    ASTNode::with_children(then_token, left, right)
+                );
+            }
+
+            TokenType::Xor =>
+            {
+                let left = ast.left.as_deref().unwrap().clone();
+                let [rule_0, rule_1] = split_xor_in_conc_ast(*ast.right.unwrap());
+                asts_to_explores.push_back(
+                    ASTNode::with_children(then_token, left.clone(), rule_0)
+                );
+                asts_to_explores.push_back(
+                    ASTNode::with_children(then_token, left, rule_1)
+                );
+            }
+
+            TokenType::Not =>
+            {
+                match ast.right.clone().unwrap().left.unwrap().token.token_type
+                {
+                    TokenType::Xor =>
+                    {
+                        let left = ast.left.as_deref().unwrap().clone();
+                        let [rule_0, rule_1] = split_not_xor_in_conc_ast(*ast.right.unwrap());
+                        asts_to_explores.push_back(
+                            ASTNode::with_children(then_token, left.clone(), rule_0)
+                        );
+                        asts_to_explores.push_back(
+                            ASTNode::with_children(then_token, left, rule_1)
+                        );
+                    }
+
+                    TokenType::Or =>
+                    {
+                        let left = ast.left.as_deref().unwrap().clone();
+                        let right = rewrite_not_or_in_conc_ast(*ast.right.unwrap());
+                        asts_to_explores.push_back(
+                            ASTNode::with_children(then_token, left, right)
+                        );
+                    }
+
+                    TokenType::And =>
+                    {
+                        let left = ast.left.as_deref().unwrap().clone();
+                        let right = rewrite_not_and_in_conc_ast(*ast.right.unwrap());
+                        asts_to_explores.push_back(
+                            ASTNode::with_children(then_token, left, right)
+                        );
+                    }
+
+                    _ => {final_asts.push(ast);}
+                }
+            } 
+
+            _ => {final_asts.push(ast);}
+        }
+    }
+
+    final_asts
+        .into_iter()
+        .map(|node|
+            {
+                let symbols = node.right.as_ref().unwrap().symbols_contained();
+                (node, symbols)
+            })
+        .collect()
 }

@@ -25,6 +25,18 @@ pub struct Token<'a>
     pub value: &'a str,
 }
 
+impl <'a>Token<'a>
+{
+    pub fn new(tt: TokenType, value: &'a str) -> Self
+    {
+        Self
+        {
+            token_type: tt,
+            value: value,
+        }
+    }
+}
+
 pub fn parse_symbol(input: &str) -> Option<usize>
 {
 	input
@@ -144,7 +156,7 @@ define_tokens!
 	And    		=> ("and",          1 << 6,  "+"),
 	Or     		=> ("or",           1 << 7,  "|"),
 	Not    		=> ("not",          1 << 8,  "!"),
-    Operator    => ("operator",     1 << 3 | 1 << 5 | 1 << 6 | 1 << 7 | 1 << 8),
+    Operator    => ("operator",     1 << 3 | 1 << 4 | 1 << 5 | 1 << 6 | 1 << 7 | 1 << 8),
 	Query  		=> ("query",        1 << 9, "?"),
 	Lp     		=> ("(",            1 << 10, "("),
 	Rp     		=> (")",            1 << 11, ")"),
