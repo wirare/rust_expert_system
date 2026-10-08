@@ -3,11 +3,19 @@ use crate::tokenizer::{Token, TokenType};
 use crate::ast::{ASTNode, build_ast, rpn, simplify_and_rewrite_rules};
 use crate::lexer;
 
-use std::collections::{HashMap, HashSet, VecDeque};
-use std::ops::Deref;
+use std::collections::{HashSet, VecDeque};
+use std::thread;
 
 pub type Rule<'a> = (ASTNode<'a>, HashSet<char>);
-type Constraint = (u32, HashSet<(char, bool)>);
+type Constraint = HashSet<(char, bool)>;
+
+#[derive(Debug)]
+struct EvaluationCtx
+{
+    symbols_state: [ProofState;26],
+    constraints: Vec<Option<Constraint>>,
+    visiting: HashSet<(char, FactState)>,
+}
 
 #[derive(Debug)]
 pub struct System<'a>
@@ -17,11 +25,9 @@ pub struct System<'a>
     query: Vec<char>,
     query_filled: bool,
     rules: Vec<Rule<'a>>,
-    rules_for_symbol: [(Vec<usize>, bool);26],
+    rules_for_symbol: [Vec<usize>;26],
+    rules_for_symbol_calculated: bool,
     base_state: [ProofState;26],
-    symbols_state: [ProofState;26],
-    constraints: Vec<Constraint>,
-    visiting: HashSet<(char, FactState)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,6 +43,24 @@ enum FactState
     True,
     False,
     Undetermined,
+    Contradiction,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum LiteralState
+{
+    Satisfied,
+    Refuted,
+    Unresolved,
+    Contradiction,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ConstraintState
+{
+    Satisfied,
+    Unresolved,
+    Forced(char, FactState),
     Contradiction,
 }
 
@@ -57,17 +81,6 @@ impl ProofState
         {
             positive: p,
             negative: n,
-        }
-    }
-
-    fn state(&self) -> FactState
-    {
-        match (self.positive, self.negative)
-        {
-            (false, false) => FactState::Undetermined,
-            (false, true) => FactState::False,
-            (true, false) => FactState::True,
-            (true, true) => FactState::Contradiction,
         }
     }
 
@@ -102,6 +115,19 @@ impl From<TokenType> for Operation
 	}
 }
 
+impl EvaluationCtx
+{
+    pub fn new() -> Self
+    {
+        Self
+        {
+            symbols_state: [ProofState::new(false, false); 26],
+            constraints: Vec::new(),
+            visiting: HashSet::new(),
+        }
+    }
+}
+
 impl<'a> System<'a>
 {
     pub fn new() -> Self
@@ -113,27 +139,15 @@ impl<'a> System<'a>
             query: Vec::new(),
             query_filled: false,
             rules: Vec::new(),
-            rules_for_symbol: std::array::from_fn(|_| (Vec::new(), false)),
+            rules_for_symbol: std::array::from_fn(|_| Vec::new()),
+            rules_for_symbol_calculated: false,
             base_state: [ProofState::new(false, false); 26],
-            symbols_state: [ProofState::new(false, false); 26],
-            constraints: Vec::new(),
-            visiting: HashSet::new(),
         }
-    }
-
-    pub fn add_rule(&mut self, rule: Rule<'a>)
-    {
-        self.rules.push(rule);
     }
 
     pub fn add_rules(&mut self, rules: Vec<Rule<'a>>)
     {
         self.rules = rules;
-    }
-
-    pub fn get_rules(&self) -> &Vec<Rule<'a>>
-    {
-        &self.rules
     }
 
     pub fn set_fact(&mut self, facts: Vec<char>) -> Result<(), String>
@@ -151,11 +165,6 @@ impl<'a> System<'a>
         Ok(())
     }
 
-    pub fn get_fact(&self) -> &Vec<char>
-    {
-        &self.facts
-    }
-
     pub fn set_query(&mut self, query: Vec<char>) -> Result<(), String>
     {
         if self.query_filled
@@ -167,41 +176,107 @@ impl<'a> System<'a>
         Ok(())
     }
 
-    pub fn get_query(&self) -> &Vec<char>
+    fn build_constraint(node: ASTNode, set: &mut HashSet<(char, bool)>, previous_is_not: bool) -> bool
     {
-        &self.query
+        match node.token.token_type
+        {
+            TokenType::Symbol =>
+            {
+                let symbol = node.token.value.chars().next().unwrap();
+                let polarity = !previous_is_not;
+
+                if set.contains(&(symbol, !polarity))
+                {
+                    return true;
+                }
+
+                set.insert((symbol, polarity));
+
+                false
+            }
+
+            TokenType::Not =>
+            {
+                System::build_constraint(*node.left.unwrap(), set, !previous_is_not)
+            }
+
+            TokenType::Or =>
+            {
+                if let Some(left) = node.left
+                {
+                    if System::build_constraint(*left, set, false)
+                    {
+                        return true;
+                    }
+                }
+
+                if let Some(right) = node.right
+                {
+                    if System::build_constraint(*right, set, false)
+                    {
+                        return true;
+                    }
+                }
+
+                false
+            }
+
+            _ =>
+            {
+                unreachable!();
+            }
+        }
     }
 
-    fn set_symbol_state(&mut self, symbol: char, state: ProofState)
+    fn add_constraint(eval_ctx: &mut EvaluationCtx, node: ASTNode, rule_idx: usize) -> bool
     {
-        self.symbols_state[symbol_to_nb(symbol)] = state;
+        let mut set: HashSet<(char, bool)> = HashSet::new();
+
+        let tautology = System::build_constraint(node, &mut set, false);
+        
+        if tautology
+        {
+            eval_ctx.constraints[rule_idx] = None;
+            return false;
+        }
+        
+        eval_ctx.constraints[rule_idx] = Some(set);
+        true
     }
 
-    fn get_symbol_state(&self, symbol: char) -> ProofState
+    fn get_constraint_for_symbol(eval_ctx: &EvaluationCtx, symbol: char) -> Vec<usize>
     {
-        self.symbols_state[symbol_to_nb(symbol)]
-    }
-
-    fn add_constraint(&mut self, constraint: Constraint)
-    {
-        self.constraints.push(constraint);
-    }
-
-    fn get_constraint_for_symbol(&self, symbol: char, polarity: bool) -> Vec<&Constraint>
-    {
-        self.constraints
+        eval_ctx.constraints
             .iter()
-            .filter(|constraint| constraint.1.contains(&(symbol, polarity)))
+            .enumerate()
+            .filter_map(|(idx, constraint)|
+            {
+                let constraint = constraint.as_ref()?;
+
+                if constraint.iter().any(|(sy, _)| *sy == symbol)
+                {
+                    Some(idx)
+                }
+                else
+                {
+                    None
+                }
+            })
             .collect()
     }
-    
-    fn get_rules_for_symbol(&mut self, symbol: char) -> &[usize]
-    {
-        let index = symbol_to_nb(symbol);
 
-        if !self.rules_for_symbol[index].1
+    pub fn compute_rules_for_symbols(&mut self)
+    {
+        if self.rules_for_symbol_calculated
         {
-            self.rules_for_symbol[index].0 = self
+            return;
+        }
+
+        for symbol in 'A'..='Z'
+        {
+            let index = symbol_to_nb(symbol);
+
+            self.rules_for_symbol[index] = self
                 .rules
                 .iter()
                 .enumerate()
@@ -212,112 +287,176 @@ impl<'a> System<'a>
                             .then_some(i)
                     })
                 .collect();
-
-            self.rules_for_symbol[index].1 = true;
         }
 
-        &self.rules_for_symbol[index].0
+        self.rules_for_symbol_calculated = true;
+    }
+    
+    fn get_rules_for_symbol(&self, symbol: char) -> &[usize]
+    {
+        let index = symbol_to_nb(symbol);
+        &self.rules_for_symbol[index]
     }
 
-    fn mark_proven(&mut self, symbol: char, target: FactState)
+    fn mark_proven(eval_ctx: &mut EvaluationCtx, symbol: char, target: FactState) -> bool
     {
-        let state = &mut self.symbols_state[symbol_to_nb(symbol)];
+        let state = &mut eval_ctx.symbols_state[symbol_to_nb(symbol)];
 
         match target
         {
-            FactState::True => state.positive = true,
-            FactState::False => state.negative = true,
+            FactState::True => 
+            {
+                if state.positive == true
+                {
+                    return false;
+                }
+                state.positive = true;
+            }
+
+            FactState::False =>
+            {
+                if state.negative == true
+                {
+                    return false;
+                }
+                state.negative = true;
+            }
             _ => unreachable!(),
         }
+
+        true
     }
 
     fn do_operation(op: Operation, lhs: FactState, rhs: Option<FactState>) -> FactState
     {
-        if matches!(lhs, FactState::Undetermined | FactState::Contradiction)
+        if lhs == FactState::Contradiction
         {
-            return lhs;
+            return FactState::Contradiction;
         }
-        if op != Operation::Not && matches!(rhs, Some(FactState::Undetermined) | Some(FactState::Contradiction))
+
+        if rhs == Some(FactState::Contradiction)
         {
-            return rhs.unwrap();
+            return FactState::Contradiction;
         }
+
         match op
         {
             Operation::Not =>
             {
                 match lhs
                 {
-                    FactState::True => FactState::False,
-                    FactState::False => FactState::True,
-                    _ => unreachable!(),
+                    FactState::True             => FactState::False,
+                    FactState::False            => FactState::True,
+                    FactState::Undetermined     => FactState::Undetermined,
+                    FactState::Contradiction    => unreachable!(),
                 }
             }
 
             Operation::And =>
             {
-                if lhs == FactState::True && rhs.unwrap() == FactState::True
+                let rhs = rhs.expect("Binary operation requires rhs");
+                match (lhs, rhs)
                 {
-                    FactState::True
-                }
-                else
-                {
-                    FactState::False
+                    (FactState::False, _) | (_, FactState::False)   => FactState::False,
+                    (FactState::True, FactState::True)              => FactState::True,
+                    _                                               => FactState::Undetermined,
                 }
             }
 
             Operation::Or =>
             {
-                if lhs == FactState::True || rhs.unwrap() == FactState::True
+                let rhs = rhs.expect("Binary operation requires rhs");
+                match (lhs, rhs)
                 {
-                    FactState::True
-                }
-                else
-                {
-                    FactState::False
+                    (FactState::True, _) | (_, FactState::True) => FactState::True,
+                    (FactState::False, FactState::False)        => FactState::False,
+                    _                                           => FactState::Undetermined,
                 }
             }
 
-            Operation::Xor => 
+            Operation::Xor =>
             {
-                if (lhs == FactState::True) ^ (rhs.unwrap() == FactState::True)
+                let rhs = rhs.expect("Binary operation requires rhs");
+                match (lhs, rhs)
                 {
-                    FactState::True
-                }
-                else
-                {
-                    FactState::False
+                    (FactState::Undetermined, _)        | (_, FactState::Undetermined)          => FactState::Undetermined,
+                    (FactState::True, FactState::False) | (FactState::False, FactState::True)   => FactState::True,
+                    (FactState::True, FactState::True)  | (FactState::False, FactState::False)  => FactState::False,
+                    _                                                                           => unreachable!(),
                 }
             }
         }
     }
 
-    fn evaluate_symbol(&mut self, symbol: char) -> Result<FactState, String>
+    fn is_symbol_in_unresolved_constraint(&self, eval_ctx: &EvaluationCtx, symbol: char) -> bool
+    {
+        let constraints = System::get_constraint_for_symbol(eval_ctx, symbol);
+
+        for idx in constraints
+        {
+            let res = self.analyze_constraint(eval_ctx, idx);
+
+            if !matches!(res.0, ConstraintState::Unresolved)
+            {
+                continue;
+            }
+
+            let constraint = eval_ctx.constraints[idx]
+                .as_ref()
+                .unwrap();
+
+            for &(sy, polarity) in constraint
+            {
+                if sy == symbol && self.classify_symbol(eval_ctx, sy, polarity) == LiteralState::Unresolved
+                {
+                    return true;
+                }
+            }
+        }
+
+        false
+    }
+
+    fn evaluate_symbol(&self, eval_ctx: &mut EvaluationCtx, symbol: char) -> Result<FactState, String>
     {
         let index = symbol_to_nb(symbol);
 
-        let mut positive = self.symbols_state[index].positive;
-        let mut negative = self.symbols_state[index].negative;
+        let mut positive = eval_ctx.symbols_state[index].positive;
+        let mut negative = eval_ctx.symbols_state[index].negative;
 
         if !positive
         {
-            positive = self.can_prove(symbol, FactState::True)?;
+            self.can_prove(eval_ctx, symbol, FactState::True)?;
         }
 
         if !negative
         {
-            negative = self.can_prove(symbol, FactState::False)?;
+            self.can_prove(eval_ctx, symbol, FactState::False)?;
         }
+
+        positive = eval_ctx.symbols_state[index].positive;
+        negative = eval_ctx.symbols_state[index].negative;
 
         Ok(match (positive, negative)
             {
                 (true, true) => FactState::Contradiction,
                 (true, false) => FactState::True,
                 (false, true) => FactState::False,
-                (false, false) => FactState::False,
+                (false, false) => 
+                {
+                    if self.is_symbol_in_unresolved_constraint(eval_ctx, symbol)
+                    {
+                        FactState::Undetermined
+                    }
+                    else
+                    {
+                        FactState::False
+                    }
+                }
             })
     }
 
-    fn evaluate_expression_from_ast(&mut self, exp: &ASTNode) -> Result<FactState, String>
+    fn evaluate_expression_from_ast(&self, eval_ctx: &mut EvaluationCtx, exp: &ASTNode) -> Result<FactState, String>
     {
         let lhs: FactState;
         let mut rhs: Option<FactState> = None;
@@ -329,7 +468,7 @@ impl<'a> System<'a>
                 .as_deref()
                 .unwrap();
 
-            lhs = self.evaluate_expression_from_ast(left)?;
+            lhs = self.evaluate_expression_from_ast(eval_ctx, left)?;
             
             if exp.token.token_type != TokenType::Not
             {
@@ -338,7 +477,7 @@ impl<'a> System<'a>
                     .as_deref()
                     .unwrap();
 
-                rhs = Some(self.evaluate_expression_from_ast(right)?);
+                rhs = Some(self.evaluate_expression_from_ast(eval_ctx, right)?);
             }
 
             return Ok(System::do_operation(exp.token.token_type.into(), lhs, rhs));
@@ -350,10 +489,10 @@ impl<'a> System<'a>
             .next()
             .unwrap();
 
-        Ok(self.evaluate_symbol(symbol)?)
+        Ok(self.evaluate_symbol(eval_ctx, symbol)?)
     }
 
-    fn evaluate_expression_from_idx(&mut self, rule_idx: usize) -> Result<FactState, String>
+    fn evaluate_expression_from_idx(&self, eval_ctx: &mut EvaluationCtx, rule_idx: usize) -> Result<FactState, String>
     {
         let expression = self.rules[rule_idx]
             .0
@@ -362,7 +501,7 @@ impl<'a> System<'a>
             .unwrap()
             .clone();
 
-        self.evaluate_expression_from_ast(&expression)
+        self.evaluate_expression_from_ast(eval_ctx, &expression)
     }
 
     fn conclusion_matches_goal(conclusion: &ASTNode<'a>, symbol: char, target: FactState) -> bool
@@ -391,8 +530,80 @@ impl<'a> System<'a>
             _ => false,
         }
     }
+
+    fn propagate_constraints_from(&self, eval_ctx: &mut EvaluationCtx, symbol: char) -> Result<(), String>
+    {
+        let mut changed_symbols: VecDeque<char> = VecDeque::new();
+        changed_symbols.push_back(symbol);
+
+        while !changed_symbols.is_empty()
+        {
+            let current = changed_symbols.pop_front().unwrap();
+            let constraint_list = System::get_constraint_for_symbol(eval_ctx, current);
+
+            for idx in constraint_list
+            {
+                let res = self.analyze_constraint(eval_ctx, idx);
+                match res.0
+                {
+                    ConstraintState::Satisfied => {}
+
+                    ConstraintState::Unresolved =>
+                    {
+                        let changed = self.resolve_unresolved_from_constraint(eval_ctx, res.1)?;
+                        changed_symbols.extend(changed.iter());
+                    }
+
+                    ConstraintState::Contradiction =>                                 
+                    {
+                        return Err(format!("Contradiction in constraint for constraint index {}", idx).to_string());
+                    }
+
+                    ConstraintState::Forced(sy, st) =>
+                    {
+                        if System::mark_proven(eval_ctx, sy, st) == true
+                        {
+                            changed_symbols.push_back(sy);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn conclusion_contains_goal(conclusion: &ASTNode<'a>, symbol: char, target: FactState) -> bool
+    {
+        match conclusion.token.token_type
+        {
+            TokenType::Symbol | TokenType::Not =>
+            {
+                Self::conclusion_matches_goal(conclusion, symbol, target)
+            }
+
+            TokenType::Or =>
+            {
+                let left = conclusion
+                    .left
+                    .as_deref()
+                    .expect("OR conclusion must have a left operand");
+
+                let right = conclusion
+                    .right
+                    .as_deref()
+                    .expect("OR conclusion must have a right operand");
+
+                Self::conclusion_contains_goal(left, symbol, target) || Self::conclusion_contains_goal(right, symbol, target)
+            }
+
+            _ =>
+            {
+                unreachable!("Normalized conclusion must contain only literals and OR");
+            }
+        }
+    }
     
-    fn can_prove(&mut self, symbol: char, target_state: FactState) -> Result<bool, String>
+    fn can_prove(&self, eval_ctx: &mut EvaluationCtx, symbol: char, target_state: FactState) -> Result<bool, String>
     {
         if matches!(target_state, FactState::Undetermined | FactState::Contradiction)
         {
@@ -401,19 +612,19 @@ impl<'a> System<'a>
         
         let index = symbol_to_nb(symbol);
 
-        if self.symbols_state[index].proves(target_state)
+        if eval_ctx.symbols_state[index].proves(target_state)
         {
             return Ok(true);
         }
 
         let visiting_key = (symbol, target_state);
 
-        if self.visiting.contains(&visiting_key)
+        if eval_ctx.visiting.contains(&visiting_key)
         {
             return Ok(false);
         }
 
-        self.visiting.insert(visiting_key);
+        eval_ctx.visiting.insert(visiting_key);
 
         let result = (|| -> Result<bool, String>
             {
@@ -423,7 +634,23 @@ impl<'a> System<'a>
 
                 for rule_idx in rules_to_visit
                 {
-                    let premise = self.evaluate_expression_from_idx(rule_idx)?;
+                    let relevant = 
+                    {
+                        let conclusion = self.rules[rule_idx]
+                            .0
+                            .right
+                            .as_deref()
+                            .unwrap();
+
+                        Self::conclusion_contains_goal(conclusion, symbol, target_state)
+                    };
+
+                    if !relevant
+                    {
+                        continue;
+                    }
+
+                    let premise = self.evaluate_expression_from_idx(eval_ctx, rule_idx)?;
 
                     match premise
                     {
@@ -454,15 +681,56 @@ impl<'a> System<'a>
 
                             if matches_goal
                             {
-                                self.mark_proven(symbol, target_state);
+                                if System::mark_proven(eval_ctx, symbol, target_state) == true
+                                {
+                                    self.propagate_constraints_from(eval_ctx, symbol)?;
+                                }
                                 return Ok(true);
                             }
 
                         }
 
-                        TokenType::Or =>
+                        TokenType::Or => 
                         {
+                            if !System::add_constraint(eval_ctx, conclusion.clone(), rule_idx)
+                            {
+                                continue;
+                            }
 
+                            let res = self.analyze_constraint(eval_ctx, rule_idx);
+                            match res.0
+                            {
+                                ConstraintState::Forced(sy, st) =>
+                                {
+                                    if System::mark_proven(eval_ctx, sy, st) == true
+                                    {
+                                        self.propagate_constraints_from(eval_ctx, sy)?;
+                                    }
+                                }
+
+                                ConstraintState::Contradiction =>
+                                {
+                                    println!("Constraints: {:#?}", eval_ctx.constraints);
+                                    return Err(format!("Contradiction in constraint for constraint index {}", rule_idx).to_string());
+                                }
+
+                                ConstraintState::Satisfied => {}
+
+                                ConstraintState::Unresolved => 
+                                {
+                                    let changed_symbols = self.resolve_unresolved_from_constraint(eval_ctx, res.1)?;
+
+                                    for sy in changed_symbols
+                                    {
+                                        self.propagate_constraints_from(eval_ctx, sy)?;
+                                    }
+                                }
+                            }
+
+                            if eval_ctx.symbols_state[index].proves(target_state)
+                            {
+                                return Ok(true);
+                            }
                         }
 
                         _ => unreachable!()
@@ -472,19 +740,231 @@ impl<'a> System<'a>
                 Ok(false)
             })();
 
-        self.visiting.remove(&visiting_key);
+        eval_ctx.visiting.remove(&visiting_key);
 
         result
     }
 
-    pub fn solve(&mut self)
+    //polarity = false -> negative, true -> positive
+    fn classify_symbol(&self, eval_ctx: &EvaluationCtx, symbol: char, polarity: bool) -> LiteralState
     {
+        let state = eval_ctx.symbols_state[symbol_to_nb(symbol)];
+        match polarity
+        {
+            true =>
+            {
+                match (state.positive, state.negative)
+                {
+                    (true, false) => LiteralState::Satisfied,
+                    (false, true) => LiteralState::Refuted,
+                    (false, false) => LiteralState::Unresolved,
+                    (true, true) => LiteralState::Contradiction,
+                }
+            }
+
+            false =>
+            {
+                match (state.positive, state.negative)
+                {
+                    (true, false) => LiteralState::Refuted,
+                    (false, true) => LiteralState::Satisfied,
+                    (false, false) => LiteralState::Unresolved,
+                    (true, true) => LiteralState::Contradiction,
+                }
+            }
+        }
+    }
+
+    fn resolve_unresolved_from_constraint(&self, eval_ctx: &mut EvaluationCtx, unresolved: Vec<(char, bool)>) -> Result<Vec<char>, String>
+    {
+        let mut changed_symbols = Vec::new();
+
+        for (symbol, _polarity) in unresolved
+        {
+            let index = symbol_to_nb(symbol);
+
+            let positive_before = eval_ctx.symbols_state[index].positive;
+            let negative_before = eval_ctx.symbols_state[index].negative;
+
+            if !positive_before
+            {
+                self.can_prove(eval_ctx, symbol, FactState::True)?;
+            }
+
+            if !negative_before
+            {
+                self.can_prove(eval_ctx, symbol, FactState::False)?;
+            }
+
+            let positive_after = eval_ctx.symbols_state[index].positive;
+            let negative_after = eval_ctx.symbols_state[index].negative;
+
+            if positive_after != positive_before || negative_after != negative_before
+            {
+                changed_symbols.push(symbol);
+            }
+
+            if positive_after && negative_after
+            {
+                return Err(format!("Contradiction found for symbol {}", symbol));
+            }
+        }
+
+        Ok(changed_symbols)
+    }
+
+    fn analyze_constraint(&self, eval_ctx: &EvaluationCtx, constraint_idx: usize) -> (ConstraintState, Vec<(char, bool)>)
+    {
+        let constraint = eval_ctx.constraints[constraint_idx].clone().unwrap();
+        let mut unresolved = Vec::new();
+        let mut satisfied = false;
+
+        for &(symbol, polarity) in constraint.iter()
+        {
+            match self.classify_symbol(eval_ctx, symbol, polarity)
+            {
+                LiteralState::Contradiction =>
+                {
+                    return (ConstraintState::Contradiction, unresolved);
+                }
+
+                LiteralState::Satisfied => 
+                {
+                    satisfied = true;
+                }
+
+                LiteralState::Unresolved =>
+                {
+                    unresolved.push((symbol, polarity));
+                }
+
+                LiteralState::Refuted => {}
+            }
+        };
+
+        if satisfied
+        {
+            return (ConstraintState::Satisfied, unresolved);
+        }
+
+        if unresolved.len() == 1
+        {
+            let (symbol, polarity) = unresolved[0];
+
+            let state = if polarity
+            {
+                FactState::True
+            }
+            else
+            {
+                FactState::False
+            };
+
+            return (ConstraintState::Forced(symbol, state), unresolved);
+        }
+
+        if unresolved.is_empty()
+        {
+            return (ConstraintState::Contradiction, unresolved);
+        }
+
+        (ConstraintState::Unresolved, unresolved)
+    }
+
+    fn verify_system_is_init(&self) -> bool
+    {
+        if !self.query_filled || !self.facts_filled || !self.rules_for_symbol_calculated
+        {
+            println!("{:#?}", self);
+            return false;
+        }
+        true
+    }
+
+    pub fn solve(&self)
+    {
+        if !self.verify_system_is_init()
+        {
+            eprintln!("System is not correctly init");
+            return;
+        }
         for symbol in self.query.clone()
         {
-            self.symbols_state = self.base_state;
-            self.visiting.clear();
-            println!("{}: {:?}", symbol, self.evaluate_symbol(symbol));
+            let mut eval_ctx = EvaluationCtx::new();
+            eval_ctx.symbols_state = self.base_state;
+            eval_ctx.constraints = vec![None; self.rules.len()];
+            let result = self.evaluate_symbol(&mut eval_ctx, symbol);
+            println!("{symbol}: {result:?}");
         }
+    }
+
+    pub fn solve_parallel(&self)
+    {
+        if !self.verify_system_is_init()
+        {
+            eprintln!("System is not correctly init");
+            return;
+        }
+
+        if self.query.is_empty()
+        {
+            return;
+        }
+
+        let worker_limit = thread::available_parallelism()
+            .map_or(1, |count| count.get())
+            .min(self.query.len());
+
+        let batch_size = self.query.len().div_ceil(worker_limit);
+
+        thread::scope(|scope|
+        {
+            let mut handles = Vec::with_capacity(worker_limit);
+
+            for queries in self.query.chunks(batch_size)
+            {
+                let handle = scope.spawn(move ||
+                {
+                    let mut eval_ctx = EvaluationCtx::new();
+
+                    let mut results = Vec::with_capacity(queries.len());
+
+                    for &symbol in queries
+                    {
+                        eval_ctx.symbols_state = self.base_state;
+                        eval_ctx.constraints = vec![None; self.rules.len()];
+                        eval_ctx.visiting.clear();
+
+                        let result = self.evaluate_symbol(&mut eval_ctx, symbol);
+
+                        results.push((symbol, result));
+                    }
+
+                    results
+                });
+
+                handles.push((queries, handle));
+            }
+
+            for (queries, handle) in handles
+            {
+                match handle.join()
+                {
+                    Ok(results) =>
+                    {
+                        for (symbol, result) in results
+                        {
+                            println!("{symbol}: {result:?}");
+                        }
+                    }
+
+                    Err(_) =>
+                    {
+                        eprintln!("A worker panicked whil evaluating queries {queries:?}");
+                    }
+                }
+            }
+        });
     }
 }
 

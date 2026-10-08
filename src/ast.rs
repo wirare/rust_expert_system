@@ -56,33 +56,6 @@ impl<'a> ASTNode<'a>
         }
     }
 
-    pub fn contain_symbol(&self, symbol: char, depth: usize) -> (bool, usize)
-    {
-        if self.token.value.chars().next().unwrap() == symbol
-        {
-            return (true, depth);
-        }
-        else
-        {
-            if let Some(left) = &self.left
-            {
-                let res = left.contain_symbol(symbol, depth + 1);
-                if res.0
-                {
-                    return (true, res.1);
-                }
-                else
-                {
-                    if let Some(right) = &self.right
-                    {
-                        return right.contain_symbol(symbol, depth + 1);
-                    }
-                }
-            }
-            return (false, depth);
-        }
-    }
-
     pub fn contain_token_mask(&self, tmask: TokenMask, depth: usize) -> (bool, usize)
     {
         if tmask.contains(self.token.token_type)
