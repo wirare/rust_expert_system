@@ -111,7 +111,8 @@ mod tests
         let source = "# Heading\n\nA => B # rule\n= # no facts\n? B";
         let output = run_source(source, SolveMode::Sequential).unwrap();
         assert_eq!(output.results.len(), 1);
-        assert_eq!(output.results[0].value, Ok(LogicValue::Undetermined));
+        // B has no support: this engine's default-false behavior applies.
+        assert_eq!(output.results[0].value, Ok(LogicValue::False));
     }
 
     #[test]
