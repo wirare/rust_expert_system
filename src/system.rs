@@ -16,8 +16,6 @@ struct EvaluationCtx
     symbols_state: [ProofState;26],
     constraints: Vec<Option<Constraint>>,
     visiting: HashSet<(char, FactState)>,
-
-    trace: Option<EvaluationTrace>,
 }
 
 #[derive(Debug)]
