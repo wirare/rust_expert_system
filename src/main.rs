@@ -45,5 +45,12 @@ fn main() -> Result<(), std::io::Error>
     let normal_solve = std::time::Instant::now();
     system.solve();
     println!("Finished normal solve in {:?}", normal_solve.elapsed());
+
+    if args.len() >= 4 && args[2] == "--report"
+    {
+        system.export_execution_json(&args[3])
+            .map_err(std::io::Error::other)?;
+        println!("Wrote reasoning report to {}", args[3]);
+    }
     Ok(())
 }
