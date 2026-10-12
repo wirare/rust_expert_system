@@ -1309,73 +1309,93 @@ impl<'a> System<'a>
 
 }
 
+/// Parse a user document, preserving physical line numbers in errors and
+/// rewrite provenance. Empty lines and '#' comments are ignored.
 pub fn parser<'a>(system: &mut System<'a>, lines: Vec<&'a str>) -> Result<(), String>
 {
-    let mut token_list: Vec<Vec<Token<'a>>> = match lines
-        .into_iter()
-        .map(lexer::lex)
-        .collect()
-    {
-        Ok(tokens) => tokens,
+    let mut token_list: Vec<(usize, Vec<Token<'a>>)> = Vec::new();
 
-        Err(err) =>
+    for (index, input) in lines.into_iter().enumerate()
+    {
+        let line = input.split_once('#').map_or(input, |(rule, _)| rule);
+        if line.trim().is_empty()
         {
-            eprintln!("Lexer error: {err}");
-            return Ok(());
+            continue;
         }
-    };
+
+        let tokens = lexer::lex(line)
+            .map_err(|error| format!("Line {}: {error}", index + 1))?;
+
+        token_list.push((index + 1, tokens));
+    }
+
+    if token_list.is_empty()
+    {
+        return Err("The input document contains no rules, facts, or queries".to_owned());
+    }
 
     let mut fact_found = false;
     let mut query_found = false;
     let mut asts = Vec::new();
 
-    for (line_index, tokens) in token_list.iter_mut().enumerate()
+    for (line_number, tokens) in &mut token_list
     {
-        grammar::check_grammar(&tokens)?;	
-        
+        let at_line = |error: &str| format!("Line {line_number}: {error}");
+
+        grammar::check_grammar(tokens).map_err(|error| at_line(&error))?;
+
         tokens.remove(0);
-	    tokens.pop();
-        
-        grammar::verify_par(&tokens)?;
-        grammar::verify_conditional_token(&tokens)?;
-        if grammar::check_fact(&tokens)?
+        tokens.pop();
+
+        grammar::verify_par(tokens).map_err(at_line)?;
+        grammar::verify_conditional_token(tokens).map_err(at_line)?;
+
+        if grammar::check_fact(tokens).map_err(at_line)?
         {
             if fact_found
             {
-                return Err("Two or more Fact token in file".to_string());
+                return Err(at_line("More than one initial-facts line"));
             }
             fact_found = true;
-            system.set_fact(
-                tokens[1..]
-                .iter()
-                .map(|token| token.value.chars().next().unwrap())
-                .collect()
-            )?;
+            system.set_fact(tokens[1..].iter().map(|token|
+            {
+                token.value.chars().next().unwrap()
+            }).collect()).map_err(|error| at_line(&error))?;
             continue;
         }
-        if grammar::check_query(&tokens)?
+
+        if grammar::check_query(tokens).map_err(at_line)?
         {
             if query_found
             {
-                return Err("Two or more Query token in file".to_string());
+                return Err(at_line("More than one query line"));
             }
             query_found = true;
-            system.set_query(
-                tokens[1..]
-                .iter()
-                .map(|token| token.value.chars().next().unwrap())
-                .collect()
-            )?;
+            system.set_query(tokens[1..].iter().map(|token|
+            {
+                token.value.chars().next().unwrap()
+            }).collect()).map_err(|error| at_line(&error))?;
             continue;
         }
-        let original = tokens.iter().map(|t| t.value).collect::<String>();
-        asts.push((build_ast(rpn(tokens.clone()))?, line_index + 1, original));
+
+        let original = tokens.iter().map(|token| token.value).collect::<String>();
+        let ast = build_ast(rpn(tokens.clone()))
+            .map_err(|error| at_line(&error))?;
+        asts.push((ast, *line_number, original));
+    }
+
+    if !fact_found
+    {
+        return Err("Missing initial facts line (e.g. '=AB' or '=')".to_owned());
+    }
+    if !query_found
+    {
+        return Err("Missing queries line (e.g. '?BC')".to_owned());
     }
 
     let (rules, history) = rewrite_with_history(asts);
     system.add_rules(rules);
     system.rewrite_history = history;
-
     Ok(())
 }
 
