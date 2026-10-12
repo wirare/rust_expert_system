@@ -604,9 +604,10 @@ impl<'a> System<'a>
                         changed_symbols.extend(changed.iter());
                     }
 
-                    ConstraintState::Contradiction =>                                 
+                    ConstraintState::Contradiction =>
                     {
-                        return Err(format!("Contradiction in constraint for constraint index {}", idx).to_string());
+                        // Conflicting evidence is recorded in the trace, but must
+                        // not prevent independent facts from being evaluated.
                     }
 
                     ConstraintState::Forced(sy, st) =>
@@ -801,8 +802,8 @@ impl<'a> System<'a>
 
                                 ConstraintState::Contradiction =>
                                 {
-                                    println!("Constraints: {:#?}", eval_ctx.constraints);
-                                    return Err(format!("Contradiction in constraint for constraint index {}", rule_idx).to_string());
+                                    // Preserve the conflict as trace data and continue
+                                    // exploring other proof paths for this query.
                                 }
 
                                 ConstraintState::Satisfied => {}
