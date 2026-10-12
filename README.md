@@ -8,17 +8,29 @@ A backward-chaining expert-system engine with a native desktop GUI.
 cargo run --release --bin gui
 ```
 
-The GUI opens a native window with an **Open .txt** file picker, an editable
-rules view, a **Parallel** checkbox, and a **Run engine** button. It shows the
-result for each queried symbol: `True`, `False`, `Undetermined`,
-`Contradiction`, or an explicit query error. Invalid source files produce an
-error message (with a source line when available), rather than misleading
-logical results.
+The GUI opens a native window with an **Open .txt** file picker, a
+**scrollable, editable** rules view, **Save / Save As**, a **Parallel** checkbox,
+and a **Run engine** button. It displays each queried symbol as `True`,
+`False`, `Undetermined`, `Contradiction`, or a query error. Invalid
+source files display an error with the source line when possible.
 
-You can edit the text in the rules pane and run it again; those edits do
-**not** overwrite the opened file. The next run uses the current editor
-contents. Opening another file or editing the current source clears old
-results. Input and mode controls are disabled while a run is in progress.
+Editing the rules marks the document **Modified**. **Save** writes the editor
+text to its existing path (or asks for a path for an untitled document).
+**Save As** chooses a new path. Failed or cancelled saves keep unsaved text
+intact. Opening another file when the editor is modified asks for
+confirmation before discarding those edits.
+
+**Initial facts** are displayed as A-Z checkboxes. They default to the
+source file's `=...` declaration. Uncheck a fact to disable it, or check
+another symbol to enable it for the next run. Checkboxes affect **both
+sequential and parallel runs** without changing the editor, the original
+`=...` line, or the contents written by Save. **Reset to source** drops
+all runtime overrides. If you edit the `=...` line, source defaults update
+while intentional checkbox overrides remain in effect until reset.
+
+Opening another file or editing the current source resets the results.
+Changing a fact toggle also clears old results. Input and mode controls are
+disabled while a run is in progress.
 
 On Ubuntu, eframe/rfd may require the usual desktop development packages,
 including `libgtk-3-dev`, `libxkbcommon-dev`, and `pkg-config`.
@@ -48,9 +60,10 @@ src/
   gui/
     mod.rs           GUI exports
     app.rs           UI composition and controls
-    document.rs      file loading and source text
+    document.rs      file loading, saving, and source text
+    facts.rs         file-derived fact defaults and runtime overrides
     runner.rs        background solver execution
-    views.rs         rules editor and query results
+    views.rs         scrolling editor, fact controls, and results
 ```
 
 This first GUI version does **not** generate or render graphs, or load traces.
