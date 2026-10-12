@@ -2,6 +2,7 @@
 name = "expert_system"
 version = "0.1.0"
 edition = "2024"
+default-run = "expert_system"
 
 [dependencies]
 eframe = "0.36.2"
