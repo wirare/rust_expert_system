@@ -592,7 +592,7 @@ pub fn rewrite_with_history<'a>(asts: Vec<(ASTNode<'a>, usize, String)>)
                         {
                             kind = Some(TransformationKind::EliminateDoubleNegation);
                             rewritten.push(ASTNode::with_children(then_token, premise,
-                                *inner.left.as_deref().unwrap().clone()));
+                                inner.left.as_deref().unwrap().clone()));
                         }
                         _ => {}
                     }
