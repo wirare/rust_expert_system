@@ -532,7 +532,7 @@ pub fn rewrite_with_history<'a>(asts: Vec<(ASTNode<'a>, usize, String)>)
         if ast.token.token_type == TokenType::Iff
         {
             kind = Some(TransformationKind::SplitBiconditional);
-            rewritten.extend(split_iff_ast(ast));
+            rewritten.extend(split_iff_ast(ast.clone()));
         }
         else
         {
