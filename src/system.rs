@@ -1152,17 +1152,38 @@ impl<'a> System<'a>
         }
     }
 
-    pub fn export_execution_json(&self, path: impl AsRef<std::path::Path>) -> Result<(), Box<dyn std::error::Error>>
+    fn write_execution_report(
+        &self,
+        path: impl AsRef<std::path::Path>,
+        pretty: bool,
+    ) -> Result<(), Box<dyn std::error::Error>>
     {
         if !self.verify_system_is_init()
         {
             return Err("System is not initialized".into());
         }
         let file = std::fs::File::create(path)?;
-        // JSON is an interchange format. Compact encoding avoids tens of
-        // thousands of indentation-only lines for large execution traces.
-        serde_json::to_writer(std::io::BufWriter::new(file), &self.execution_report())?;
+        let writer = std::io::BufWriter::new(file);
+        let report = self.execution_report();
+        if pretty
+        {
+            serde_json::to_writer_pretty(writer, &report)?;
+        }
+        else
+        {
+            serde_json::to_writer(writer, &report)?;
+        }
         Ok(())
+    }
+
+    pub fn export_execution_json(&self, path: impl AsRef<std::path::Path>) -> Result<(), Box<dyn std::error::Error>>
+    {
+        self.write_execution_report(path, false)
+    }
+
+    pub fn export_execution_json_pretty(&self, path: impl AsRef<std::path::Path>) -> Result<(), Box<dyn std::error::Error>>
+    {
+        self.write_execution_report(path, true)
     }
 
     pub fn solve(&self)
