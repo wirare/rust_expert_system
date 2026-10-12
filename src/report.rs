@@ -112,6 +112,9 @@ pub enum GraphNodeKind
         previous_attempt: AttemptId,
     },
 
+    /// Grouped searches for one logical goal; individual attempts are in the trace.
+    SearchGoal { goal: Literal },
+
     Event { event_id: EventId },
     RuleVersion { version_id: RuleVersionId },
 }
@@ -126,7 +129,7 @@ pub struct GraphEdge
     pub related_event: Option<EventId>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum EdgeKind
 {
     SearchDependency,
@@ -221,33 +224,128 @@ pub struct ExecutionReport
 
 impl ReasoningGraph
 {
+
+    /// A compact semantic projection of the execution trace.
+    ///
+    /// The trace retains every attempt and event. This graph intentionally
+    /// groups repeated visits to the same goal/rule/constraint, and does not
+    /// create a second copy of every chronological event.
     pub fn from_trace(trace: &EvaluationTrace) -> Self
     {
-        use crate::trace::{TraceEventKind as T, ProofOrigin};
+        use crate::trace::{ProofOrigin, TraceEvent, TraceEventKind as T};
         use std::collections::{HashMap, HashSet};
-        const FACT_BASE: u64 = 1_000_000_000;
+
         const RULE_BASE: u64 = 2_000_000_000;
         const CONSTRAINT_BASE: u64 = 3_000_000_000;
-        const ATTEMPT_BASE: u64 = 4_000_000_000;
-        const QUERY_BASE: u64 = 5_000_000_000;
-        let mut graph = Self { nodes: Vec::new(), edges: Vec::new() };
-        let mut used = HashSet::new();
-        let mut links = HashSet::new();
-        let mut attempts = HashMap::new();
-        let mut known_rules = HashSet::new();
-        let mut known_constraints = HashSet::new();
-        let mut known_facts = HashSet::new();
+        const GOAL_BASE: u64 = 4_000_000_000;
+        const QUERY_ID: u64 = 5_000_000_000;
 
-        let mut link = |from: NodeId, to: NodeId, kind: EdgeKind, event: Option<EventId>, graph: &mut Self|
+        fn literal_label(literal: &Literal) -> String
         {
-            if from != to && links.insert((from, to, format!("{kind:?}")))
+            if literal.positive
             {
-                graph.edges.push(GraphEdge { from, to, kind, related_event: event });
+                literal.symbol.to_string()
             }
-        };
-        let query_id = QUERY_BASE;
-        graph.nodes.push(GraphNode {
-            id: query_id,
+            else
+            {
+                format!("!{}", literal.symbol)
+            }
+        }
+
+        fn goal_id(literal: Literal) -> NodeId
+        {
+            GOAL_BASE
+                + (literal.symbol as u64 - 'A' as u64) * 2
+                + u64::from(!literal.positive)
+        }
+
+        fn record_node(
+            graph: &mut ReasoningGraph,
+            indices: &mut HashMap<NodeId, usize>,
+            node: GraphNode,
+        )
+        {
+            if let Some(&idx) = indices.get(&node.id)
+            {
+                graph.nodes[idx].related_events.extend(node.related_events);
+            }
+            else
+            {
+                indices.insert(node.id, graph.nodes.len());
+                graph.nodes.push(node);
+            }
+        }
+
+        fn link(
+            graph: &mut ReasoningGraph,
+            known: &mut HashSet<(NodeId, NodeId, EdgeKind)>,
+            from: NodeId,
+            to: NodeId,
+            kind: EdgeKind,
+            event_id: EventId,
+        )
+        {
+            if from == to && kind != EdgeKind::CycleReference
+            {
+                return;
+            }
+            if known.insert((from, to, kind))
+            {
+                graph.edges.push(GraphEdge {
+                    from,
+                    to,
+                    kind,
+                    related_event: Some(event_id),
+                });
+            }
+        }
+
+        /// Traverse only recorded evidence links; never treat a failed search
+        /// or an event that happened earlier as proof for an applied rule.
+        fn supporting_proofs(events: &[TraceEvent], roots: &[EventId]) -> Vec<EventId>
+        {
+            let mut stack = roots.to_vec();
+            let mut visited = HashSet::new();
+            let mut proofs = HashSet::new();
+            while let Some(id) = stack.pop()
+            {
+                if !visited.insert(id)
+                {
+                    continue;
+                }
+                let Some(event) = events.get(id as usize) else
+                {
+                    continue;
+                };
+                match &event.kind
+                {
+                    T::LiteralProven { .. } =>
+                    {
+                        proofs.insert(id);
+                    }
+                    T::ProofReused { original_event, .. } =>
+                    {
+                        stack.push(*original_event);
+                    }
+                    _ =>
+                    {
+                        stack.extend(event.causes.iter().copied());
+                    }
+                }
+            }
+            let mut proofs: Vec<_> = proofs.into_iter().collect();
+            proofs.sort_unstable();
+            proofs
+        }
+
+        let mut graph = Self { nodes: Vec::new(), edges: Vec::new() };
+        let mut indices: HashMap<NodeId, usize> = HashMap::new();
+        let mut known_links: HashSet<(NodeId, NodeId, EdgeKind)> = HashSet::new();
+        let mut attempts: HashMap<AttemptId, NodeId> = HashMap::new();
+        let mut parents: HashMap<AttemptId, Option<AttemptId>> = HashMap::new();
+
+        record_node(&mut graph, &mut indices, GraphNode {
+            id: QUERY_ID,
             kind: GraphNodeKind::Query {
                 symbol: trace.query,
                 outcome: QueryOutcome::Value(LogicValue::Undetermined),
@@ -255,152 +353,249 @@ impl ReasoningGraph
             label: format!("Query {}", trace.query),
             related_events: Vec::new(),
         });
-        used.insert(query_id);
 
         for event in &trace.events
         {
-            let node_id = event.id;
-            if !used.insert(node_id) { continue; }
-            let label = format!("{:?}", event.kind);
-            let kind = match &event.kind
-            {
-                T::SearchStarted { attempt_id, goal, .. } =>
-                {
-                    attempts.insert(*attempt_id, node_id);
-                    GraphNodeKind::SearchAttempt {
-                        attempt_id: *attempt_id,
-                        goal: *goal,
-                        outcome: SearchOutcome::NotProven,
-                    }
-                }
-                T::LiteralProven { literal, .. } =>
-                    GraphNodeKind::Deduction { literal: *literal, proof_event: event.id },
-                T::ConstraintActivated { constraint_id, literals, .. } =>
-                    GraphNodeKind::Constraint { constraint_id: *constraint_id, literals: literals.clone() },
-                T::CycleDetected { previous_attempt, .. } =>
-                    GraphNodeKind::Cycle {
-                        attempt_id: event.attempt_id.unwrap_or(*previous_attempt),
-                        previous_attempt: *previous_attempt,
-                    },
-                _ => GraphNodeKind::Event { event_id: event.id },
-            };
-            graph.nodes.push(GraphNode { id: node_id, kind, label, related_events: vec![event.id] });
-            for &cause in &event.causes
-            {
-                link(cause, node_id, EdgeKind::Justification, Some(event.id), &mut graph);
-            }
-            if let Some(attempt) = event.attempt_id
-            {
-                if let Some(&start) = attempts.get(&attempt)
-                {
-                    link(start, node_id, EdgeKind::SearchDependency, Some(event.id), &mut graph);
-                }
-            }
             match &event.kind
             {
-                T::SearchStarted { parent_attempt, .. } =>
-                {
-                    if let Some(parent) = parent_attempt.and_then(|a| attempts.get(&a).copied())
-                    {
-                        link(parent, node_id, EdgeKind::SearchDependency, Some(event.id), &mut graph);
-                    }
-                    else if parent_attempt.is_none()
-                    {
-                        link(query_id, node_id, EdgeKind::SearchDependency, Some(event.id), &mut graph);
-                    }
-                }
-                T::SearchFinished { attempt_id, outcome } =>
-                {
-                    if let Some(&start) = attempts.get(attempt_id)
-                    {
-                        if let Some(node) = graph.nodes.iter_mut().find(|node| node.id == start)
-                        {
-                            if let GraphNodeKind::SearchAttempt { outcome: previous, .. } = &mut node.kind
-                            {
-                                *previous = outcome.clone();
-                            }
-                        }
-                        link(node_id, start, EdgeKind::Return, Some(event.id), &mut graph);
-                    }
-                }
-                T::CycleDetected { previous_attempt, .. } =>
-                {
-                    if let Some(&start) = attempts.get(previous_attempt)
-                    {
-                        link(node_id, start, EdgeKind::CycleReference, Some(event.id), &mut graph);
-                    }
-                }
-                T::RuleConsidered { rule_id } | T::RuleApplied { rule_id } | T::PremiseEvaluated { rule_id, .. } =>
-                {
-                    let rule_node = RULE_BASE + *rule_id as u64;
-                    if known_rules.insert(*rule_id)
-                    {
-                        graph.nodes.push(GraphNode { id: rule_node, kind: GraphNodeKind::Rule { rule_id: *rule_id }, label: format!("Rule {rule_id}"), related_events: Vec::new() });
-                    }
-                    link(rule_node, node_id, EdgeKind::PremiseDependency, Some(event.id), &mut graph);
-                }
-                T::ConstraintActivated { constraint_id, rule_id, .. } =>
-                {
-                    let rule_node = RULE_BASE + *rule_id as u64;
-                    if known_rules.insert(*rule_id)
-                    {
-                        graph.nodes.push(GraphNode { id: rule_node, kind: GraphNodeKind::Rule { rule_id: *rule_id }, label: format!("Rule {rule_id}"), related_events: Vec::new() });
-                    }
-                    link(rule_node, node_id, EdgeKind::ConstraintActivation, Some(event.id), &mut graph);
-                    known_constraints.insert(*constraint_id);
-                }
-                T::ConstraintEvaluated { constraint_id, .. } =>
-                {
-                    let clause = trace.events.iter().find_map(|e| match &e.kind {
-                        T::ConstraintActivated { constraint_id: idx, .. } if idx == constraint_id => Some(e.id),
-                        _ => None,
-                    });
-                    if let Some(activated) = clause
-                    {
-                        link(activated, node_id, EdgeKind::ConstraintActivation, Some(event.id), &mut graph);
-                    }
-                    let _ = CONSTRAINT_BASE; // reserved for stable constraint entities
-                }
                 T::LiteralProven { literal, origin } =>
                 {
-                    if let ProofOrigin::InitialFact = origin
+                    let kind = if matches!(origin, ProofOrigin::InitialFact)
                     {
-                        let fact_node = FACT_BASE + (literal.symbol as u64 - 'A' as u64);
-                        if known_facts.insert(literal.symbol)
-                        {
-                            graph.nodes.push(GraphNode { id: fact_node, kind: GraphNodeKind::InitialFact { symbol: literal.symbol }, label: literal.symbol.to_string(), related_events: vec![event.id] });
+                        GraphNodeKind::InitialFact { symbol: literal.symbol }
+                    }
+                    else
+                    {
+                        GraphNodeKind::Deduction {
+                            literal: *literal,
+                            proof_event: event.id,
                         }
-                        link(fact_node, node_id, EdgeKind::Justification, Some(event.id), &mut graph);
+                    };
+
+                    record_node(&mut graph, &mut indices, GraphNode {
+                        id: event.id,
+                        kind,
+                        label: literal_label(literal),
+                        related_events: vec![event.id],
+                    });
+
+                    match origin
+                    {
+                        ProofOrigin::InitialFact => {}
+                        ProofOrigin::Rule { rule_id } =>
+                        {
+                            link(
+                                &mut graph, &mut known_links,
+                                RULE_BASE + *rule_id as u64,
+                                event.id, EdgeKind::Justification, event.id,
+                            );
+                        }
+                        ProofOrigin::UnitPropagation { constraint_id } =>
+                        {
+                            let clause_id = CONSTRAINT_BASE + *constraint_id as u64;
+                            link(
+                                &mut graph, &mut known_links,
+                                clause_id, event.id, EdgeKind::UnitPropagation, event.id,
+                            );
+                            // Only direct proof events are independent refutations
+                            // of another literal in the clause.
+                            for &cause in &event.causes
+                            {
+                                if trace.events.get(cause as usize).is_some_and(|e|
+                                    matches!(e.kind, T::LiteralProven { .. }))
+                                {
+                                    link(
+                                        &mut graph, &mut known_links,
+                                        cause, clause_id, EdgeKind::Justification, event.id,
+                                    );
+                                }
+                            }
+                        }
                     }
                 }
+
+                T::SearchStarted { attempt_id, parent_attempt, goal } =>
+                {
+                    let id = goal_id(*goal);
+                    attempts.insert(*attempt_id, id);
+                    parents.insert(*attempt_id, *parent_attempt);
+                    record_node(&mut graph, &mut indices, GraphNode {
+                        id,
+                        kind: GraphNodeKind::SearchGoal { goal: *goal },
+                        label: format!("Prove {}", literal_label(goal)),
+                        related_events: vec![event.id],
+                    });
+
+                    let parent = parent_attempt
+                        .and_then(|parent| attempts.get(&parent).copied())
+                        .unwrap_or(QUERY_ID);
+                    link(
+                        &mut graph, &mut known_links,
+                        parent, id, EdgeKind::SearchDependency, event.id,
+                    );
+                }
+
+                T::SearchFinished { attempt_id, outcome: _ } =>
+                {
+                    if let Some(&id) = attempts.get(attempt_id)
+                    {
+                        if let Some(&idx) = indices.get(&id)
+                        {
+                            graph.nodes[idx].related_events.push(event.id);
+                        }
+                        for &cause in &event.causes
+                        {
+                            if trace.events.get(cause as usize).is_some_and(|e|
+                                matches!(e.kind, T::LiteralProven { .. }))
+                            {
+                                link(
+                                    &mut graph, &mut known_links,
+                                    cause, id, EdgeKind::Justification, event.id,
+                                );
+                            }
+                        }
+                        let parent = parents.get(attempt_id).copied().flatten()
+                            .and_then(|parent| attempts.get(&parent).copied())
+                            .unwrap_or(QUERY_ID);
+                        link(
+                            &mut graph, &mut known_links,
+                            id, parent, EdgeKind::Return, event.id,
+                        );
+                    }
+                }
+
+                T::CycleDetected { previous_attempt, .. } =>
+                {
+                    let to = attempts.get(previous_attempt).copied();
+                    let from = event.attempt_id.and_then(|id| attempts.get(&id).copied());
+                    if let (Some(from), Some(to)) = (from, to)
+                    {
+                        link(
+                            &mut graph, &mut known_links,
+                            from, to, EdgeKind::CycleReference, event.id,
+                        );
+                    }
+                }
+
+                T::RuleConsidered { rule_id }
+                | T::PremiseEvaluated { rule_id, .. }
+                | T::RuleApplied { rule_id } =>
+                {
+                    let id = RULE_BASE + *rule_id as u64;
+                    record_node(&mut graph, &mut indices, GraphNode {
+                        id,
+                        kind: GraphNodeKind::Rule { rule_id: *rule_id },
+                        label: format!("Rule {}", rule_id),
+                        related_events: vec![event.id],
+                    });
+
+                    if let T::RuleConsidered { .. } = &event.kind
+                    {
+                        if let Some(goal) = event.attempt_id
+                            .and_then(|attempt| attempts.get(&attempt).copied())
+                        {
+                            link(
+                                &mut graph, &mut known_links,
+                                goal, id, EdgeKind::SearchDependency, event.id,
+                            );
+                        }
+                    }
+                    if let T::RuleApplied { .. } = &event.kind
+                    {
+                        for proof in supporting_proofs(&trace.events, &event.causes)
+                        {
+                            link(
+                                &mut graph, &mut known_links,
+                                proof, id, EdgeKind::PremiseDependency, event.id,
+                            );
+                        }
+                    }
+                }
+
+                T::ConstraintActivated { constraint_id, rule_id, literals } =>
+                {
+                    let id = CONSTRAINT_BASE + *constraint_id as u64;
+                    record_node(&mut graph, &mut indices, GraphNode {
+                        id,
+                        kind: GraphNodeKind::Constraint {
+                            constraint_id: *constraint_id,
+                            literals: literals.clone(),
+                        },
+                        label: literals.iter().map(literal_label).collect::<Vec<_>>().join(" | "),
+                        related_events: vec![event.id],
+                    });
+                    link(
+                        &mut graph, &mut known_links,
+                        RULE_BASE + *rule_id as u64, id,
+                        EdgeKind::ConstraintActivation, event.id,
+                    );
+                    if let Some(goal) = event.attempt_id
+                        .and_then(|attempt| attempts.get(&attempt).copied())
+                    {
+                        link(
+                            &mut graph, &mut known_links,
+                            id, goal, EdgeKind::SearchDependency, event.id,
+                        );
+                    }
+                }
+
+                T::ConstraintEvaluated { constraint_id, .. } =>
+                {
+                    let id = CONSTRAINT_BASE + *constraint_id as u64;
+                    if let Some(&idx) = indices.get(&id)
+                    {
+                        graph.nodes[idx].related_events.push(event.id);
+                    }
+                }
+
                 T::ProofReused { original_event, .. } =>
-                    link(*original_event, node_id, EdgeKind::ProofReuse, Some(event.id), &mut graph),
+                {
+                    let to = event.attempt_id
+                        .and_then(|attempt| attempts.get(&attempt).copied())
+                        .unwrap_or(QUERY_ID);
+                    link(
+                        &mut graph, &mut known_links,
+                        *original_event, to, EdgeKind::ProofReuse, event.id,
+                    );
+                }
+
                 T::QueryFinished { result } =>
                 {
-                    if let Some(root) = graph.nodes.iter_mut().find(|node| node.id == query_id)
+                    if let Some(&idx) = indices.get(&QUERY_ID)
                     {
-                        if let GraphNodeKind::Query { outcome, .. } = &mut root.kind
+                        if let GraphNodeKind::Query { outcome, .. } =
+                            &mut graph.nodes[idx].kind
                         {
                             *outcome = QueryOutcome::Value(*result);
                         }
+                        graph.nodes[idx].related_events.push(event.id);
                     }
-                    link(node_id, query_id, EdgeKind::Return, Some(event.id), &mut graph);
+                    for &cause in &event.causes
+                    {
+                        link(
+                            &mut graph, &mut known_links,
+                            cause, QUERY_ID, EdgeKind::Justification, event.id,
+                        );
+                    }
                 }
+
                 T::QueryFailed { message } =>
                 {
-                    if let Some(root) = graph.nodes.iter_mut().find(|node| node.id == query_id)
+                    if let Some(&idx) = indices.get(&QUERY_ID)
                     {
-                        if let GraphNodeKind::Query { outcome, .. } = &mut root.kind
+                        if let GraphNodeKind::Query { outcome, .. } =
+                            &mut graph.nodes[idx].kind
                         {
                             *outcome = QueryOutcome::Error { message: message.clone() };
                         }
+                        graph.nodes[idx].related_events.push(event.id);
                     }
-                    link(node_id, query_id, EdgeKind::Return, Some(event.id), &mut graph);
-                },
-                _ => {}
+                }
+
+                T::ExpressionEvaluated { .. } => {}
             }
-            let _ = ATTEMPT_BASE;
         }
+
         graph
     }
 
