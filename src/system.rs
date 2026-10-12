@@ -932,7 +932,7 @@ impl<'a> System<'a>
             };
             let proof_slot = symbol_to_nb(symbol) * 2
                 + usize::from(target_state == FactState::False);
-            let causes = if matches!(result, Ok(true))
+            let causes = if matches!(&result, Ok(true))
             {
                 eval_ctx.proof_events[proof_slot].into_iter().collect()
             }
@@ -1042,6 +1042,9 @@ impl<'a> System<'a>
                 LiteralState::Refuted => {}
             }
         };
+
+        // Stable traversal order makes the trace reproducible across runs.
+        unresolved.sort_unstable();
 
         if satisfied
         {
@@ -1399,7 +1402,7 @@ mod inference_tests
         let report = system.execution_report();
         let encoded = serde_json::to_string(&report).unwrap();
         let decoded: crate::report::ExecutionReport = serde_json::from_str(&encoded).unwrap();
-        assert_eq!(decoded.schema_version, 1);
+        assert_eq!(decoded.schema_version, 2);
         assert_eq!(decoded.queries.len(), 1);
         assert!(!decoded.queries[0].trace.events.is_empty());
     }
@@ -1422,8 +1425,22 @@ mod inference_tests
         assert!(deduction.causes.iter().any(|cause| activations.contains(cause)), "forced proof must depend on activation");
         assert!(deduction.causes.iter().any(|cause| events.iter().any(|e| e.id == *cause &&
             matches!(e.kind, TraceEventKind::LiteralProven { literal: Literal {symbol:'C', positive:false}, .. }))), "forced proof must depend on !C");
-        assert!(query.graph.edges.iter().any(|edge| edge.to == deduction.id &&
-            activations.contains(&edge.from)), "graph must connect the proof sources");
+        let clause_id = 3_000_000_000 + events.iter().find_map(|e| {
+            if let TraceEventKind::ConstraintActivated { constraint_id, .. } = e.kind
+            {
+                Some(constraint_id as u64)
+            }
+            else { None }
+        }).unwrap();
+        assert!(query.graph.edges.iter().any(|edge| edge.from == clause_id &&
+            edge.to == deduction.id && edge.kind == crate::report::EdgeKind::UnitPropagation),
+            "semantic graph must connect the active clause to the deduction");
+        let refutation = events.iter().find(|e| matches!(e.kind, TraceEventKind::LiteralProven {
+            literal: Literal { symbol: 'C', positive: false }, ..
+        })).unwrap();
+        assert!(query.graph.edges.iter().any(|edge| edge.from == refutation.id &&
+            edge.to == clause_id && edge.kind == crate::report::EdgeKind::Justification),
+            "semantic graph must connect the explicit refutation to the clause");
     }
 
     #[test]
@@ -1455,6 +1472,55 @@ mod inference_tests
             matches!(event.kind, TraceEventKind::ProofReused {
                 literal: Literal { symbol: 'A', positive: true }, ..
             })));
+    }
+
+    #[test]
+    fn query_outcome_evidence_is_query_specific()
+    {
+        let input = "A=>B\nC=>!B\n=AC\n?B";
+        let mut system = System::new();
+        parser(&mut system, input.lines().collect()).unwrap();
+        system.compute_rules_for_symbols();
+        let trace = system.evaluate_traced('B').trace;
+        let last = trace.events.last().unwrap();
+        assert!(matches!(last.kind, TraceEventKind::QueryFinished {
+            result: crate::trace::LogicValue::Contradiction
+        }));
+        let mut evidence = trace.events.iter().filter_map(|event| {
+            match &event.kind {
+                TraceEventKind::LiteralProven { literal: Literal { symbol:'B', .. }, .. } =>
+                    Some(event.id),
+                _ => None,
+            }
+        }).collect::<Vec<_>>();
+        evidence.sort_unstable();
+        let mut recorded = last.causes.clone();
+        recorded.sort_unstable();
+        assert_eq!(recorded, evidence, "a contradiction needs both signed proofs");
+    }
+
+    #[test]
+    fn complex_input_export_keeps_graph_compact()
+    {
+        let input = include_str!("../test.txt");
+        let mut system = System::new();
+        parser(&mut system, input.lines().filter(|line| !line.trim().is_empty()).collect()).unwrap();
+        system.compute_rules_for_symbols();
+        let report = system.execution_report();
+        assert_eq!(report.queries.len(), 26);
+        let events: usize = report.queries.iter().map(|q| q.trace.events.len()).sum();
+        let nodes: usize = report.queries.iter().map(|q| q.graph.nodes.len()).sum();
+        assert!(events > 1_000, "the chronological trace should stay complete");
+        assert!(nodes < events / 3, "semantic graph should not duplicate each trace event");
+        let bytes = serde_json::to_vec(&report).unwrap();
+        assert!(bytes.len() < 2_000_000, "compact report should remain below 2 MB");
+        for query in &report.queries
+        {
+            let ids: HashSet<_> = query.graph.nodes.iter().map(|n| n.id).collect();
+            assert_eq!(ids.len(), query.graph.nodes.len(), "unique node IDs");
+            assert!(query.graph.edges.iter().all(|e|
+                ids.contains(&e.from) && ids.contains(&e.to)), "all edges must reference existing nodes");
+        }
     }
 
 }
