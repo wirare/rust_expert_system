@@ -1,16 +1,6 @@
 use std::{env, fs};
 
-mod lexer;
-mod tokenizer;
-mod grammar;
-mod system;
-mod ast;
-mod trace;
-mod report;
-
-use system::System;
-
-use crate::system::parser;
+use expert_system::system::{parser, System};
 
 fn main() -> Result<(), Box<dyn std::error::Error>>
 {
@@ -22,7 +12,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>>
         return Ok(());
     }
     let file = fs::read_to_string(args[1].clone())?;
-    let split: Vec<&str> = file.lines().filter(|line| !line.trim().is_empty()).collect();
+    let split: Vec<&str> = file.lines().collect();
     let mut system = System::new();
     match parser(&mut system, split)
     {

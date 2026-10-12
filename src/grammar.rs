@@ -210,6 +210,18 @@ static GRAMMAR_MAP: LazyLock<HashMap<TokenType, TokenMask>> = LazyLock::new(||
 
 pub fn check_grammar(tokens: &Vec<Token>) -> Result<(), String>
 {
+    // 'Start' and 'End' are sentinel tokens; a real statement must exist.
+    if tokens.len() < 3
+    {
+        return Err("Empty statement".to_owned());
+    }
+
+    let last = tokens[tokens.len() - 2].token_type;
+    if !matches!(last, TokenType::Symbol | TokenType::Rp | TokenType::Fact)
+    {
+        return Err("Unexpected end of line: incomplete expression or empty query".to_owned());
+    }
+
     let mut current: &Token = tokens.iter().nth(1).unwrap();
     let mut prev: &Token = tokens.iter().nth(0).unwrap();
     let mut i = 2;
