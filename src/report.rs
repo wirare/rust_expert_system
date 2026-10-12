@@ -189,3 +189,29 @@ pub enum TransformationKind
     RemoveTautology,
     DeduplicateLiterals,
 }
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RewriteHistory
+{
+    pub original_rules: Vec<OriginalRule>,
+    pub normalized_rules: Vec<NormalizedRule>,
+    pub rule_versions: Vec<RuleVersion>,
+    pub transformations: Vec<RuleTransformation>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QueryExecution
+{
+    pub symbol: char,
+    pub outcome: QueryOutcome,
+    pub trace: EvaluationTrace,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExecutionReport
+{
+    pub schema_version: u32,
+    pub initial_facts: Vec<char>,
+    pub rewrite: RewriteHistory,
+    pub queries: Vec<QueryExecution>,
+}
