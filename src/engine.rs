@@ -6,6 +6,7 @@
 use std::time::{Duration, Instant};
 
 use crate::system::{System, parser};
+use crate::report::{ExecutionReport, QueryOutcome};
 use crate::trace::LogicValue;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -31,6 +32,9 @@ pub struct RunReport
     pub parse_duration: Duration,
     pub solve_duration: Duration,
     pub total_duration: Duration,
+    /// Full traces, rewrite provenance, and graph data for all queries.
+    /// Produced after the selected sequential/parallel result calculation.
+    pub execution: ExecutionReport,
 }
 
 /// Read the source's initial-facts declaration for frontend controls.
@@ -106,6 +110,26 @@ fn run_source_inner(
     };
     let solve_duration = solve_started.elapsed();
 
+    // Retain a fully owned report for the graph UI and future trace tools.
+    // Trace collection is query-local and intentionally independent from
+    // whether the primary solve ran sequentially or in parallel.
+    let execution = system.execution_report();
+    for ((symbol, value), query) in outputs.iter().zip(&execution.queries)
+    {
+        let matching = match (value, &query.outcome)
+        {
+            (Ok(left), QueryOutcome::Value(right)) => left == right,
+            (Err(left), QueryOutcome::Error { message }) => left == message,
+            _ => false,
+        };
+        if *symbol != query.symbol || !matching
+        {
+            return Err(format!(
+                "Inference and trace results disagree for query {symbol}"
+            ));
+        }
+    }
+
     Ok(RunReport
     {
         mode,
@@ -117,6 +141,7 @@ fn run_source_inner(
         parse_duration,
         solve_duration,
         total_duration: started.elapsed(),
+        execution,
     })
 }
 
@@ -124,6 +149,47 @@ fn run_source_inner(
 mod tests
 {
     use super::*;
+
+    #[test]
+    fn captures_graphs_for_each_query_and_rewrite_rules()
+    {
+        let source = "A=>B\n=A\n?AB";
+        let run = run_source(source, SolveMode::Sequential).unwrap();
+
+        assert_eq!(run.execution.queries.len(), 2);
+        assert_eq!(run.execution.queries[0].symbol, 'A');
+        assert_eq!(run.execution.queries[1].symbol, 'B');
+
+        for (result, query) in run.results.iter().zip(&run.execution.queries)
+        {
+            assert_eq!(result.symbol, query.symbol);
+            assert!(!query.graph.nodes.is_empty());
+            assert!(!query.trace.events.is_empty());
+            assert_eq!(query.graph.nodes.iter().filter(|node|
+                matches!(node.kind, crate::report::GraphNodeKind::Query { .. })).count(), 1);
+        }
+        assert_eq!(run.execution.rewrite.normalized_rules.len(), 1);
+    }
+
+    #[test]
+    fn graph_reflects_overridden_facts_and_parallel_mode()
+    {
+        let source = "A=>B\n=A\n?B";
+        let mut facts = [false; 26];
+        facts[0] = true;
+        let enabled = run_source_with_facts(source, SolveMode::Parallel, facts).unwrap();
+        assert_eq!(enabled.results[0].value, Ok(LogicValue::True));
+        assert!(enabled.execution.initial_facts.contains(&'A'));
+
+        facts[0] = false;
+        let disabled = run_source_with_facts(source, SolveMode::Parallel, facts).unwrap();
+        assert_eq!(disabled.results[0].value, Ok(LogicValue::False));
+        assert!(!disabled.execution.initial_facts.contains(&'A'));
+        assert!(matches!(
+            disabled.execution.queries[0].outcome,
+            QueryOutcome::Value(LogicValue::False)
+        ));
+    }
 
     #[test]
     fn sequential_and_parallel_results_match()

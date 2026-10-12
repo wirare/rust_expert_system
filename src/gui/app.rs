@@ -6,8 +6,18 @@ use crate::engine::SolveMode;
 
 use super::document::SourceDocument;
 use super::facts::FactControls;
+use super::graph::GraphViewer;
+use super::runner::RunState;
 use super::runner::RunController;
 use super::views;
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum WorkspaceView
+{
+    #[default]
+    Rules,
+    Graph,
+}
 
 #[derive(Default)]
 pub struct ExpertSystemApp
@@ -18,6 +28,8 @@ pub struct ExpertSystemApp
     parallel: bool,
     file_error: Option<String>,
     confirm_discard_before_open: bool,
+    workspace: WorkspaceView,
+    graph_viewer: GraphViewer,
 }
 
 impl ExpertSystemApp
@@ -163,6 +175,21 @@ impl eframe::App for ExpertSystemApp
                 }
             });
 
+            ui.add_space(6.0);
+            ui.horizontal(|ui|
+            {
+                ui.selectable_value(
+                    &mut self.workspace,
+                    WorkspaceView::Rules,
+                    "Rules / Results",
+                );
+                ui.selectable_value(
+                    &mut self.workspace,
+                    WorkspaceView::Graph,
+                    "Reasoning graph",
+                );
+            });
+
             ui.add_space(7.0);
             let fact_controls_enabled = !self.runner.is_running() && self.document.has_input();
             if views::fact_editor(ui, &mut self.facts, fact_controls_enabled)
@@ -178,26 +205,77 @@ impl eframe::App for ExpertSystemApp
             }
         });
 
-        egui::Panel::left("source")
-            .resizable(true)
-            .default_size(650.0)
-            .min_size(300.0)
-            .show(ui, |ui|
-            {
-                if views::source_editor(ui, &mut self.document, !self.runner.is_running())
-                {
-                    // Source edits only update the file-derived defaults.
-                    // Explicit fact toggles continue to override those defaults.
-                    self.facts.sync_source(&self.document.text);
-                    self.runner.clear();
-                    self.file_error = None;
-                }
-            });
-
-        egui::CentralPanel::default().show(ui, |ui|
+        match self.workspace
         {
-            views::results(ui, &self.runner.state);
-        });
+            WorkspaceView::Rules =>
+            {
+                egui::Panel::left("source")
+                    .resizable(true)
+                    .default_size(650.0)
+                    .min_size(300.0)
+                    .show(ui, |ui|
+                    {
+                        if views::source_editor(
+                            ui,
+                            &mut self.document,
+                            !self.runner.is_running(),
+                        )
+                        {
+                            self.facts.sync_source(&self.document.text);
+                            self.runner.clear();
+                            self.file_error = None;
+                        }
+                    });
+
+                egui::CentralPanel::default().show(ui, |ui|
+                {
+                    views::results(ui, &self.runner.state);
+                });
+            }
+
+            WorkspaceView::Graph =>
+            {
+                // The graph fills the entire workspace rather than being
+                // squeezed beside the rule editor. The layout is read-only.
+                egui::CentralPanel::default().show(ui, |ui|
+                {
+                    match &self.runner.state
+                    {
+                        RunState::Completed(run) =>
+                        {
+                            self.graph_viewer.show(
+                                ui,
+                                &run.execution,
+                                self.runner.revision(),
+                            );
+                        }
+                        RunState::Running =>
+                        {
+                            ui.horizontal(|ui|
+                            {
+                                ui.spinner();
+                                ui.label("Building reasoning graphs...");
+                            });
+                            ui.ctx().request_repaint_after(
+                                std::time::Duration::from_millis(100),
+                            );
+                        }
+                        RunState::Failed(error) =>
+                        {
+                            ui.colored_label(
+                                egui::Color32::from_rgb(244, 101, 101),
+                                format!("Inference failed: {error}"),
+                            );
+                            ui.weak("Return to Rules / Results to correct the source.");
+                        }
+                        RunState::Idle =>
+                        {
+                            ui.weak("Run the engine to generate reasoning graphs.");
+                        }
+                    }
+                });
+            }
+        }
 
         if self.confirm_discard_before_open
         {

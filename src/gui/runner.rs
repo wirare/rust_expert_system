@@ -19,13 +19,14 @@ pub struct RunController
 {
     pub state: RunState,
     receiver: Option<Receiver<Result<RunReport, String>>>,
+    generation: u64,
 }
 
 impl Default for RunController
 {
     fn default() -> Self
     {
-        Self { state: RunState::Idle, receiver: None }
+        Self { state: RunState::Idle, receiver: None, generation: 0 }
     }
 }
 
@@ -52,12 +53,20 @@ impl RunController
         matches!(self.state, RunState::Running)
     }
 
+    /// Changes whenever a new run starts or old results are invalidated.
+    /// Graph layouts can cache by this revision and their selected query.
+    pub fn revision(&self) -> u64
+    {
+        self.generation
+    }
+
     pub fn clear(&mut self)
     {
         if !self.is_running()
         {
             self.state = RunState::Idle;
             self.receiver = None;
+            self.generation = self.generation.wrapping_add(1);
         }
     }
 
@@ -79,6 +88,7 @@ impl RunController
         let (sender, receiver) = mpsc::channel();
         self.receiver = Some(receiver);
         self.state = RunState::Running;
+        self.generation = self.generation.wrapping_add(1);
 
         std::thread::spawn(move ||
         {
