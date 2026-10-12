@@ -470,8 +470,8 @@ impl<'a> System<'a>
     {
         let index = symbol_to_nb(symbol);
 
-        let mut positive = eval_ctx.symbols_state[index].positive;
-        let mut negative = eval_ctx.symbols_state[index].negative;
+        let positive = eval_ctx.symbols_state[index].positive;
+        let negative = eval_ctx.symbols_state[index].negative;
 
         if !positive
         {
@@ -483,8 +483,8 @@ impl<'a> System<'a>
             self.can_prove(eval_ctx, symbol, FactState::False)?;
         }
 
-        positive = eval_ctx.symbols_state[index].positive;
-        negative = eval_ctx.symbols_state[index].negative;
+        let positive = eval_ctx.symbols_state[index].positive;
+        let negative = eval_ctx.symbols_state[index].negative;
 
         Ok(match (positive, negative)
             {
@@ -1201,5 +1201,77 @@ impl From<FactState> for crate::trace::LogicValue
             FactState::Undetermined => Self::Undetermined,
             FactState::Contradiction => Self::Contradiction,
         }
+    }
+}
+
+#[cfg(test)]
+mod inference_tests
+{
+    use super::*;
+    use crate::trace::TraceEventKind;
+
+    fn check(input: &str, query: char) -> (FactState, QueryExecution)
+    {
+        let mut system = System::new();
+        parser(&mut system, input.lines().filter(|line| !line.trim().is_empty()).collect()).unwrap();
+        system.compute_rules_for_symbols();
+        let mut ctx = EvaluationCtx::new();
+        ctx.symbols_state = system.base_state;
+        ctx.constraints = vec![None; system.rules.len()];
+        let value = system.evaluate_symbol(&mut ctx, query).unwrap();
+        let traced = system.evaluate_traced(query);
+        (value, traced)
+    }
+
+    #[test]
+    fn contradicting_dependencies_do_not_abort_queries()
+    {
+        let input = "A<=>B+C\nD=>E+F+G\nB=>!(C|D)\nE=>!F\n=ABDE\n?CDEFG";
+        let (c, trace) = check(input, 'C');
+        assert_eq!(c, FactState::Contradiction);
+        assert!(trace.trace.events.iter().any(|event|
+            matches!(event.kind, TraceEventKind::SearchStarted { .. })));
+        assert_eq!(check(input, 'D').0, FactState::Contradiction);
+        assert_eq!(check(input, 'F').0, FactState::Contradiction);
+    }
+
+    #[test]
+    fn forced_or_literature_and_ambiguous_or()
+    {
+        let input = "A=>B|C\nD=>!C\nA=>M|N\n=AD\n?BCMN";
+        assert_eq!(check(input, 'B').0, FactState::True);
+        assert_eq!(check(input, 'C').0, FactState::False);
+        assert_eq!(check(input, 'M').0, FactState::Undetermined);
+        assert_eq!(check(input, 'N').0, FactState::Undetermined);
+    }
+
+    #[test]
+    fn preserves_rewrite_versions()
+    {
+        let input = "A<=>B+C\n=A\n?B";
+        let mut system = System::new();
+        parser(&mut system, input.lines().collect()).unwrap();
+        let history = system.rewrite_history();
+        assert_eq!(history.original_rules.len(), 1);
+        assert_eq!(history.normalized_rules.len(), 3);
+        assert!(history.transformations.iter().any(|t|
+            matches!(t.kind, crate::report::TransformationKind::SplitBiconditional)));
+        assert!(history.transformations.iter().any(|t|
+            matches!(t.kind, crate::report::TransformationKind::SplitAndConclusion)));
+    }
+
+    #[test]
+    fn json_report_round_trip()
+    {
+        let input = "A=>B\n=A\n?B";
+        let mut system = System::new();
+        parser(&mut system, input.lines().collect()).unwrap();
+        system.compute_rules_for_symbols();
+        let report = system.execution_report();
+        let encoded = serde_json::to_string(&report).unwrap();
+        let decoded: crate::report::ExecutionReport = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded.schema_version, 1);
+        assert_eq!(decoded.queries.len(), 1);
+        assert!(!decoded.queries[0].trace.events.is_empty());
     }
 }
