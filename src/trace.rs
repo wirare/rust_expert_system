@@ -21,7 +21,7 @@ pub enum LogicValue
     Contradiction,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SearchOutcome
 {
     Proven,
