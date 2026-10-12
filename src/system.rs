@@ -188,6 +188,33 @@ impl<'a> System<'a>
         Ok(())
     }
 
+    /// Override the initial facts for a single run after parsing.
+    ///
+    /// This changes the knowledge base's initial true facts, not the source
+    /// text, rules, or rewrite history. It can be used by any frontend.
+    pub fn replace_initial_facts(&mut self, enabled: [bool; 26]) -> Result<(), String>
+    {
+        if !self.facts_filled
+        {
+            return Err("The source has no initial-facts declaration".to_owned());
+        }
+
+        self.base_state = [ProofState::new(false, false); 26];
+        self.facts.clear();
+
+        for (index, &active) in enabled.iter().enumerate()
+        {
+            if active
+            {
+                let symbol = (b'A' + index as u8) as char;
+                self.facts.push(symbol);
+                self.base_state[index] = ProofState::new(true, false);
+            }
+        }
+
+        Ok(())
+    }
+
     pub fn set_query(&mut self, query: Vec<char>) -> Result<(), String>
     {
         if self.query_filled
