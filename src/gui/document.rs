@@ -57,7 +57,7 @@ impl SourceDocument
         let mut picker = rfd::FileDialog::new()
             .set_title("Save expert-system rules")
             .add_filter("Text rule files", &["txt"])
-            .set_file_name(self.name());
+            .set_file_name(if self.path.is_some() { self.name() } else { "rules.txt" });
 
         if let Some(directory) = self.path.as_ref().and_then(|path| path.parent())
         {
