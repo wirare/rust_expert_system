@@ -33,16 +33,68 @@ pub struct RunReport
     pub total_duration: Duration,
 }
 
+/// Read the source's initial-facts declaration for frontend controls.
+///
+/// The engine parser still validates the input on Run. This lightweight
+/// projection intentionally ignores malformed characters here so users can
+/// correct bad source text in the editor without losing the fact controls.
+pub fn source_initial_facts(source: &str) -> [bool; 26]
+{
+    let mut enabled = [false; 26];
+
+    for raw in source.lines()
+    {
+        let line = raw.split('#').next().unwrap_or("").trim_start();
+        if let Some(facts) = line.strip_prefix('=')
+        {
+            for symbol in facts.bytes()
+            {
+                if symbol.is_ascii_uppercase()
+                {
+                    enabled[(symbol - b'A') as usize] = true;
+                }
+            }
+            break;
+        }
+    }
+
+    enabled
+}
+
 /// Parse, normalize, and evaluate the *current source snapshot*.
 ///
 /// An input/initialization error fails the entire run. An inference error
 /// belongs to one query and is retained beside that query's symbol.
 pub fn run_source(source: &str, mode: SolveMode) -> Result<RunReport, String>
 {
+    run_source_inner(source, mode, None)
+}
+
+/// Evaluate using an independently selected initial-fact set. Neither the
+/// input string nor its '=...' declaration is changed.
+pub fn run_source_with_facts(
+    source: &str,
+    mode: SolveMode,
+    active_facts: [bool; 26],
+) -> Result<RunReport, String>
+{
+    run_source_inner(source, mode, Some(active_facts))
+}
+
+fn run_source_inner(
+    source: &str,
+    mode: SolveMode,
+    active_facts: Option<[bool; 26]>,
+) -> Result<RunReport, String>
+{
     let started = Instant::now();
     let mut system = System::new();
 
     parser(&mut system, source.lines().collect())?;
+    if let Some(facts) = active_facts
+    {
+        system.replace_initial_facts(facts)?;
+    }
     system.compute_rules_for_symbols();
 
     let parse_duration = started.elapsed();
@@ -113,6 +165,47 @@ mod tests
         assert_eq!(output.results.len(), 1);
         // B has no support: this engine's default-false behavior applies.
         assert_eq!(output.results[0].value, Ok(LogicValue::False));
+    }
+
+    #[test]
+    fn source_fact_detection_skips_comments_and_whitespace()
+    {
+        let input = "# =AB ignored\nA=>B\n  = A C # D is commented\n?B";
+        let facts = source_initial_facts(input);
+        assert!(facts[0]);
+        assert!(!facts[1]);
+        assert!(facts[2]);
+        assert!(!facts[3]);
+    }
+
+    #[test]
+    fn runtime_fact_overrides_are_independent_of_source_text()
+    {
+        let source = "A=>B\nC=>D\n=A\n?BCD".to_owned();
+        let saved = source.clone();
+
+        let original = run_source(&source, SolveMode::Sequential).unwrap();
+        assert_eq!(original.results[0].value, Ok(LogicValue::True));
+        assert_eq!(original.results[2].value, Ok(LogicValue::False));
+
+        let mut facts = [false; 26];
+        facts[2] = true; // C enabled, A disabled (despite '=A' in source).
+
+        let sequential = run_source_with_facts(&source, SolveMode::Sequential, facts).unwrap();
+        let parallel = run_source_with_facts(&source, SolveMode::Parallel, facts).unwrap();
+
+        assert_eq!(sequential.results, parallel.results);
+        assert_eq!(sequential.results[0].value, Ok(LogicValue::False));
+        assert_eq!(sequential.results[1].value, Ok(LogicValue::True));
+        assert_eq!(source, saved);
+    }
+
+    #[test]
+    fn override_does_not_hide_syntax_errors()
+    {
+        let error = run_source_with_facts("A=>\n=A\n?B", SolveMode::Parallel, [true; 26])
+            .unwrap_err();
+        assert!(error.contains("Line 1"));
     }
 
     #[test]

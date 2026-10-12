@@ -6,6 +6,7 @@ use crate::engine::{RunReport, SolveMode};
 use crate::trace::LogicValue;
 
 use super::document::SourceDocument;
+use super::facts::FactControls;
 use super::runner::RunState;
 
 /// Draw the current source file. Returns true if the user changed its contents.
@@ -40,17 +41,84 @@ pub fn source_editor(ui: &mut egui::Ui, document: &mut SourceDocument, editable:
 
     // The text is intentionally editable: Run uses the editor contents,
     // including unsaved changes, without modifying the opened file.
-    let width = ui.available_width();
-    let editor = egui::TextEdit::multiline(&mut document.text)
-        .code_editor()
-        .desired_width(width)
-        .desired_rows(30);
+    // Explicit bounded scroll area: long rule files can be scrolled with
+    // the mouse wheel or the permanently visible vertical scrollbar.
+    let available_height = ui.available_height();
+    let changed = egui::ScrollArea::vertical()
+        .id_salt("rule_source_scroll")
+        .auto_shrink([false, false])
+        .max_height(available_height)
+        .scroll_bar_visibility(
+            egui::containers::scroll_area::ScrollBarVisibility::AlwaysVisible
+        )
+        .show(ui, |ui|
+        {
+            let editor = egui::TextEdit::multiline(&mut document.text)
+                .code_editor()
+                .desired_width(ui.available_width())
+                .desired_rows(30);
 
-    let changed = ui.add_enabled(editable, editor).changed();
+            ui.add_enabled(editable, editor).changed()
+        }).inner;
+
     if changed
     {
         document.mark_modified();
     }
+    changed
+}
+
+/// Fact controls do not edit the source's '=...' line. Return true when the
+/// effective runtime facts changed.
+pub fn fact_editor(ui: &mut egui::Ui, facts: &mut FactControls, editable: bool) -> bool
+{
+    let mut changed = false;
+
+    ui.horizontal_wrapped(|ui|
+    {
+        ui.strong("Initial facts");
+        ui.weak("Applied only to the next run; does not modify the file");
+
+        if ui.add_enabled(editable && facts.override_count() > 0,
+            egui::Button::new("Reset to source")).clicked()
+        {
+            facts.restore_source();
+            changed = true;
+        }
+    });
+
+    ui.add_enabled_ui(editable, |ui|
+    {
+        egui::Grid::new("initial_fact_toggles")
+            .num_columns(13)
+            .spacing([12.0, 5.0])
+            .show(ui, |ui|
+            {
+                for index in 0..26
+                {
+                    let mut active = facts.enabled(index);
+                    let symbol = (b'A' + index as u8) as char;
+                    if ui.checkbox(&mut active, symbol.to_string()).changed()
+                    {
+                        facts.set_enabled(index, active);
+                        changed = true;
+                    }
+                    if index == 12
+                    {
+                        ui.end_row();
+                    }
+                }
+            });
+    });
+
+    if facts.override_count() != 0
+    {
+        ui.small(format!(
+            "{} override(s) active. Reset restores the source's initial facts.",
+            facts.override_count()
+        ));
+    }
+
     changed
 }
 
