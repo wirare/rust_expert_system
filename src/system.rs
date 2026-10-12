@@ -21,6 +21,9 @@ struct EvaluationCtx
     attempt_stack: Vec<u64>,
     active_attempts: std::collections::HashMap<(char, FactState), u64>,
     proof_events: [Option<EventId>; 52],
+    constraint_activation: Vec<Option<EventId>>,
+    last_evidence: Vec<EventId>,
+    constraint_last_evaluation: Vec<Option<EventId>>,
 }
 
 #[derive(Debug)]
@@ -135,6 +138,9 @@ impl EvaluationCtx
             attempt_stack: Vec::new(),
             active_attempts: std::collections::HashMap::new(),
             proof_events: [None; 52],
+            constraint_activation: Vec::new(),
+            last_evidence: Vec::new(),
+            constraint_last_evaluation: Vec::new(),
         }
     }
 }
@@ -357,22 +363,39 @@ impl<'a> System<'a>
         ctx.trace.as_mut().map(|trace| trace.record(attempt_id, kind, causes))
     }
 
-    fn mark_from_rule(ctx: &mut EvaluationCtx, symbol: char, state: FactState, rule_id: usize) -> bool
+    fn mark_from_rule(ctx: &mut EvaluationCtx, symbol: char, state: FactState, rule_id: usize, causes: Vec<EventId>) -> bool
     {
-        Self::mark_proven(ctx, symbol, state, ProofOrigin::Rule { rule_id }, Vec::new())
+        Self::mark_proven(ctx, symbol, state, ProofOrigin::Rule { rule_id }, causes)
     }
 
     fn mark_from_constraint(ctx: &mut EvaluationCtx, symbol: char, state: FactState, constraint_id: usize) -> bool
     {
-        let causes = ctx.constraints[constraint_id].as_ref().map(|clause|
+        let mut causes = Vec::new();
+        if let Some(id) = ctx.constraint_activation.get(constraint_id).copied().flatten()
         {
-            clause.iter().filter_map(|&(other, polarity)|
+            causes.push(id);
+        }
+        if let Some(id) = ctx.constraint_last_evaluation.get(constraint_id).copied().flatten()
+        {
+            causes.push(id);
+        }
+        if let Some(clause) = ctx.constraints[constraint_id].as_ref()
+        {
+            let mut literals: Vec<_> = clause.iter().copied().collect();
+            literals.sort_unstable();
+            for (other, polarity) in literals
             {
-                if other == symbol { return None; }
+                if other == symbol { continue; }
+                // Unit propagation needs explicit proof of the opposite polarity.
                 let slot = symbol_to_nb(other) * 2 + usize::from(polarity);
-                ctx.proof_events[slot]
-            }).collect::<Vec<_>>()
-        }).unwrap_or_default();
+                if let Some(id) = ctx.proof_events[slot]
+                {
+                    causes.push(id);
+                }
+            }
+        }
+        causes.sort_unstable();
+        causes.dedup();
         Self::mark_proven(ctx, symbol, state, ProofOrigin::UnitPropagation { constraint_id }, causes)
     }
 
@@ -477,10 +500,24 @@ impl<'a> System<'a>
         {
             self.can_prove(eval_ctx, symbol, FactState::True)?;
         }
+        else if let Some(id) = eval_ctx.proof_events[index * 2]
+        {
+            Self::emit(eval_ctx, TraceEventKind::ProofReused {
+                literal: Literal { symbol, positive: true },
+                original_event: id,
+            }, vec![id]);
+        }
 
         if !negative
         {
             self.can_prove(eval_ctx, symbol, FactState::False)?;
+        }
+        else if let Some(id) = eval_ctx.proof_events[index * 2 + 1]
+        {
+            Self::emit(eval_ctx, TraceEventKind::ProofReused {
+                literal: Literal { symbol, positive: false },
+                original_event: id,
+            }, vec![id]);
         }
 
         let positive = eval_ctx.symbols_state[index].positive;
@@ -507,38 +544,46 @@ impl<'a> System<'a>
 
     fn evaluate_expression_from_ast(&self, eval_ctx: &mut EvaluationCtx, exp: &ASTNode) -> Result<FactState, String>
     {
-        let lhs: FactState;
-        let mut rhs: Option<FactState> = None;
-
-        if exp.token.is_operator()
+        let mut causes = Vec::new();
+        let result = if exp.token.is_operator()
         {
-            let left = exp
-                .left
-                .as_deref()
-                .unwrap();
-
-            lhs = self.evaluate_expression_from_ast(eval_ctx, left)?;
-            
-            if exp.token.token_type != TokenType::Not
+            let lhs = self.evaluate_expression_from_ast(eval_ctx, exp.left.as_deref().unwrap())?;
+            causes.extend(eval_ctx.last_evidence.iter().copied());
+            let rhs = if exp.token.token_type != TokenType::Not
             {
-                let right = exp
-                    .right
-                    .as_deref()
-                    .unwrap();
-
-                rhs = Some(self.evaluate_expression_from_ast(eval_ctx, right)?);
+                let rhs = self.evaluate_expression_from_ast(eval_ctx, exp.right.as_deref().unwrap())?;
+                causes.extend(eval_ctx.last_evidence.iter().copied());
+                Some(rhs)
             }
-
-            return Ok(System::do_operation(exp.token.token_type.into(), lhs, rhs));
+            else { None };
+            System::do_operation(exp.token.token_type.into(), lhs, rhs)
         }
-        let symbol = exp
-            .token
-            .value
-            .chars()
-            .next()
-            .unwrap();
-
-        Ok(self.evaluate_symbol(eval_ctx, symbol)?)
+        else
+        {
+            let symbol = exp.token.value.chars().next().unwrap();
+            let state = self.evaluate_symbol(eval_ctx, symbol)?;
+            let index = symbol_to_nb(symbol) * 2;
+            if eval_ctx.symbols_state[symbol_to_nb(symbol)].positive
+            {
+                causes.extend(eval_ctx.proof_events[index]);
+            }
+            if eval_ctx.symbols_state[symbol_to_nb(symbol)].negative
+            {
+                causes.extend(eval_ctx.proof_events[index + 1]);
+            }
+            state
+        };
+        causes.sort_unstable();
+        causes.dedup();
+        if eval_ctx.trace.is_some()
+        {
+            let expression = crate::ast::format_ast(exp);
+            let event = Self::emit(eval_ctx, TraceEventKind::ExpressionEvaluated {
+                expression, result: result.into(), operand_events: causes.clone(),
+            }, causes);
+            eval_ctx.last_evidence = event.into_iter().collect();
+        }
+        Ok(result)
     }
 
     fn evaluate_expression_from_idx(&self, eval_ctx: &mut EvaluationCtx, rule_idx: usize) -> Result<FactState, String>
@@ -636,7 +681,9 @@ impl<'a> System<'a>
             },
             ConstraintState::Contradiction => ConstraintOutcome::Contradiction,
         };
-        Self::emit(ctx, TraceEventKind::ConstraintEvaluated { constraint_id: idx, result }, vec![]);
+        let causes = ctx.constraint_activation.get(idx).copied().flatten().into_iter().collect();
+        let event = Self::emit(ctx, TraceEventKind::ConstraintEvaluated { constraint_id: idx, result }, causes);
+        if let Some(slot) = ctx.constraint_last_evaluation.get_mut(idx) { *slot = event; }
     }
 
     fn conclusion_contains_goal(conclusion: &ASTNode<'a>, symbol: char, target: FactState) -> bool
@@ -681,6 +728,14 @@ impl<'a> System<'a>
 
         if eval_ctx.symbols_state[index].proves(target_state)
         {
+            let slot = index * 2 + usize::from(target_state == FactState::False);
+            if let Some(original_event) = eval_ctx.proof_events[slot]
+            {
+                Self::emit(eval_ctx, TraceEventKind::ProofReused {
+                    literal: Literal { symbol, positive: target_state == FactState::True },
+                    original_event,
+                }, vec![original_event]);
+            }
             return Ok(true);
         }
 
@@ -691,7 +746,21 @@ impl<'a> System<'a>
         {
             if let Some(&previous_attempt) = eval_ctx.active_attempts.get(&visiting_key)
             {
-                Self::emit(eval_ctx, TraceEventKind::CycleDetected { goal: literal, previous_attempt }, vec![]);
+                let cycle = Self::emit(eval_ctx, TraceEventKind::CycleDetected { goal: literal, previous_attempt }, vec![]);
+                if let Some(event_id) = cycle
+                {
+                    let attempt_id = eval_ctx.trace.as_mut().map(|t| {
+                        let id = t.attempts;
+                        t.attempts += 1;
+                        id
+                    });
+                    if let Some(id) = attempt_id
+                    {
+                        let parent_attempt = eval_ctx.attempt_stack.last().copied();
+                        Self::emit(eval_ctx, TraceEventKind::SearchStarted { attempt_id: id, parent_attempt, goal: literal }, vec![event_id]);
+                        Self::emit(eval_ctx, TraceEventKind::SearchFinished { attempt_id: id, outcome: SearchOutcome::BlockedByCycle }, vec![event_id]);
+                    }
+                }
             }
             return Ok(false);
         }
@@ -738,7 +807,8 @@ impl<'a> System<'a>
 
                     Self::emit(eval_ctx, TraceEventKind::RuleConsidered { rule_id: rule_idx }, vec![]);
                     let premise = self.evaluate_expression_from_idx(eval_ctx, rule_idx)?;
-                    Self::emit(eval_ctx, TraceEventKind::PremiseEvaluated { rule_id: rule_idx, result: premise.into() }, vec![]);
+                    let premise_causes = eval_ctx.last_evidence.clone();
+                    let premise_event = Self::emit(eval_ctx, TraceEventKind::PremiseEvaluated { rule_id: rule_idx, result: premise.into() }, premise_causes);
 
                     match premise
                     {
@@ -762,7 +832,7 @@ impl<'a> System<'a>
                         .as_deref()
                         .unwrap();
 
-                    Self::emit(eval_ctx, TraceEventKind::RuleApplied { rule_id: rule_idx }, vec![]);
+                    let applied = Self::emit(eval_ctx, TraceEventKind::RuleApplied { rule_id: rule_idx }, premise_event.into_iter().collect());
                     match conclusion.token.token_type
                     {
                         TokenType::Symbol | TokenType::Not =>
@@ -771,7 +841,7 @@ impl<'a> System<'a>
 
                             if matches_goal
                             {
-                                if System::mark_from_rule(eval_ctx, symbol, target_state, rule_idx) == true
+                                if System::mark_from_rule(eval_ctx, symbol, target_state, rule_idx, applied.into_iter().collect()) == true
                                 {
                                     self.propagate_constraints_from(eval_ctx, symbol)?;
                                 }
@@ -786,7 +856,13 @@ impl<'a> System<'a>
                             {
                                 continue;
                             }
-                            Self::emit(eval_ctx, TraceEventKind::ConstraintActivated { constraint_id: rule_idx, rule_id: rule_idx }, vec![]);
+                            let mut literals: Vec<_> = eval_ctx.constraints[rule_idx].as_ref().unwrap().iter().map(|&(symbol, positive)| Literal { symbol, positive }).collect();
+                            literals.sort_by_key(|lit| (lit.symbol, lit.positive));
+                            let activated = Self::emit(eval_ctx, TraceEventKind::ConstraintActivated { constraint_id: rule_idx, rule_id: rule_idx, literals }, applied.into_iter().collect());
+                            if let Some(slot) = eval_ctx.constraint_activation.get_mut(rule_idx)
+                            {
+                                *slot = activated;
+                            }
 
                             let res = self.analyze_constraint(eval_ctx, rule_idx);
                             Self::trace_constraint(eval_ctx, rule_idx, &res);
@@ -838,7 +914,8 @@ impl<'a> System<'a>
             let outcome = match &result
             {
                 Ok(true) => SearchOutcome::Proven,
-                Ok(false) | Err(_) => SearchOutcome::NotProven,
+                Ok(false) => SearchOutcome::NotProven,
+                Err(message) => SearchOutcome::Error { message: message.clone() },
             };
             Self::emit(eval_ctx, TraceEventKind::SearchFinished { attempt_id, outcome }, vec![]);
             eval_ctx.active_attempts.remove(&visiting_key);
@@ -987,6 +1064,8 @@ impl<'a> System<'a>
         let mut ctx = EvaluationCtx::new();
         ctx.symbols_state = self.base_state;
         ctx.constraints = vec![None; self.rules.len()];
+        ctx.constraint_activation = vec![None; self.rules.len()];
+        ctx.constraint_last_evaluation = vec![None; self.rules.len()];
         ctx.trace = Some(EvaluationTrace::new(symbol));
 
         for fact in &self.facts
@@ -1002,15 +1081,20 @@ impl<'a> System<'a>
         }
 
         let result = self.evaluate_symbol(&mut ctx, symbol);
+        let final_causes = ctx.last_evidence.clone();
+        match &result
+        {
+            Ok(value) => { Self::emit(&mut ctx, TraceEventKind::QueryFinished { result: (*value).into() }, final_causes); }
+            Err(message) => { Self::emit(&mut ctx, TraceEventKind::QueryFailed { message: message.clone() }, Vec::new()); }
+        }
         let outcome = match result
         {
             Ok(value) => QueryOutcome::Value(value.into()),
             Err(message) => QueryOutcome::Error { message },
         };
-        QueryExecution {
-            symbol, outcome,
-            trace: ctx.trace.take().unwrap(),
-        }
+        let trace = ctx.trace.take().unwrap();
+        let graph = crate::report::ReasoningGraph::from_trace(&trace);
+        QueryExecution { symbol, outcome, trace, graph }
     }
 
     pub fn execution_report(&self) -> ExecutionReport
@@ -1019,6 +1103,7 @@ impl<'a> System<'a>
             schema_version: 1,
             initial_facts: self.facts.clone(),
             rewrite: self.rewrite_history.clone(),
+            rewrite_graph: crate::report::ReasoningGraph::from_rewrite(&self.rewrite_history),
             queries: self.query.iter().map(|&symbol| self.evaluate_traced(symbol)).collect(),
         }
     }
@@ -1275,4 +1360,58 @@ mod inference_tests
         assert_eq!(decoded.queries.len(), 1);
         assert!(!decoded.queries[0].trace.events.is_empty());
     }
+    #[test]
+    fn graph_report_contains_actual_justification_edges()
+    {
+        let input = "A=>B|C\nD=>!C\n=AD\n?B";
+        let mut system = System::new();
+        parser(&mut system, input.lines().collect()).unwrap();
+        system.compute_rules_for_symbols();
+        let report = system.execution_report();
+        let query = &report.queries[0];
+        assert!(matches!(query.outcome, QueryOutcome::Value(crate::trace::LogicValue::True)));
+        let events = &query.trace.events;
+        let activations: Vec<_> = events.iter().filter(|e| matches!(e.kind, TraceEventKind::ConstraintActivated { .. })).map(|e| e.id).collect();
+        assert!(!activations.is_empty(), "constraint activated");
+        let deduction = events.iter().find(|e| matches!(e.kind, TraceEventKind::LiteralProven {
+            literal: Literal { symbol: 'B', positive: true }, ..
+        })).expect("B proven");
+        assert!(deduction.causes.iter().any(|cause| activations.contains(cause)), "forced proof must depend on activation");
+        assert!(deduction.causes.iter().any(|cause| events.iter().any(|e| e.id == *cause &&
+            matches!(e.kind, TraceEventKind::LiteralProven { literal: Literal {symbol:'C', positive:false}, .. }))), "forced proof must depend on !C");
+        assert!(query.graph.edges.iter().any(|edge| edge.to == deduction.id &&
+            activations.contains(&edge.from)), "graph must connect the proof sources");
+    }
+
+    #[test]
+    fn graph_contains_rewrite_history_and_refs()
+    {
+        let input = "A<=>B+C\n=A\n?B";
+        let mut system = System::new();
+        parser(&mut system, input.lines().collect()).unwrap();
+        system.compute_rules_for_symbols();
+        let report = system.execution_report();
+        assert!(!report.rewrite_graph.edges.is_empty());
+        assert_eq!(report.rewrite_graph.nodes.iter().filter(|node| matches!(node.kind,
+            crate::report::GraphNodeKind::Transformation { .. })).count(),
+            report.rewrite.transformations.len());
+        let serialized = serde_json::to_string(&report).unwrap();
+        let decoded: crate::report::ExecutionReport = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(decoded.queries[0].graph.edges.len(), report.queries[0].graph.edges.len());
+    }
+
+    #[test]
+    fn cached_fact_emits_proof_reuse()
+    {
+        let input = "A=>B\n=A\n?B";
+        let mut system = System::new();
+        parser(&mut system, input.lines().collect()).unwrap();
+        system.compute_rules_for_symbols();
+        let trace = system.evaluate_traced('B').trace;
+        assert!(trace.events.iter().any(|event|
+            matches!(event.kind, TraceEventKind::ProofReused {
+                literal: Literal { symbol: 'A', positive: true }, ..
+            })));
+    }
+
 }
