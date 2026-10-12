@@ -2,6 +2,7 @@ use crate::grammar;
 use crate::tokenizer::{Token, TokenType};
 use crate::ast::{ASTNode, build_ast, rpn, simplify_and_rewrite_rules};
 use crate::lexer;
+use crate::trace::EvaluationTrace;
 
 use std::collections::{HashSet, VecDeque};
 use std::thread;
@@ -15,6 +16,8 @@ struct EvaluationCtx
     symbols_state: [ProofState;26],
     constraints: Vec<Option<Constraint>>,
     visiting: HashSet<(char, FactState)>,
+
+    trace: Option<EvaluationTrace>,
 }
 
 #[derive(Debug)]

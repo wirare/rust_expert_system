@@ -5,6 +5,8 @@ mod tokenizer;
 mod grammar;
 mod system;
 mod ast;
+mod trace;
+mod report;
 
 use system::System;
 
