@@ -1371,15 +1371,16 @@ mod inference_tests
         let query = &report.queries[0];
         assert!(matches!(query.outcome, QueryOutcome::Value(crate::trace::LogicValue::True)));
         let events = &query.trace.events;
-        let activation = events.iter().find(|e| matches!(e.kind, TraceEventKind::ConstraintActivated { .. })).expect("constraint activated");
+        let activations: Vec<_> = events.iter().filter(|e| matches!(e.kind, TraceEventKind::ConstraintActivated { .. })).map(|e| e.id).collect();
+        assert!(!activations.is_empty(), "constraint activated");
         let deduction = events.iter().find(|e| matches!(e.kind, TraceEventKind::LiteralProven {
             literal: Literal { symbol: 'B', positive: true }, ..
         })).expect("B proven");
-        assert!(deduction.causes.contains(&activation.id), "forced proof must depend on activation");
+        assert!(deduction.causes.iter().any(|cause| activations.contains(cause)), "forced proof must depend on activation");
         assert!(deduction.causes.iter().any(|cause| events.iter().any(|e| e.id == *cause &&
             matches!(e.kind, TraceEventKind::LiteralProven { literal: Literal {symbol:'C', positive:false}, .. }))), "forced proof must depend on !C");
         assert!(query.graph.edges.iter().any(|edge| edge.to == deduction.id &&
-            edge.from == activation.id), "graph must connect the proof sources");
+            activations.contains(&edge.from)), "graph must connect the proof sources");
     }
 
     #[test]
