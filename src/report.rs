@@ -309,10 +309,17 @@ impl ReasoningGraph
                         link(query_id, node_id, EdgeKind::SearchDependency, Some(event.id), &mut graph);
                     }
                 }
-                T::SearchFinished { attempt_id, .. } =>
+                T::SearchFinished { attempt_id, outcome } =>
                 {
                     if let Some(&start) = attempts.get(attempt_id)
                     {
+                        if let Some(node) = graph.nodes.iter_mut().find(|node| node.id == start)
+                        {
+                            if let GraphNodeKind::SearchAttempt { outcome: previous, .. } = &mut node.kind
+                            {
+                                *previous = outcome.clone();
+                            }
+                        }
                         link(node_id, start, EdgeKind::Return, Some(event.id), &mut graph);
                     }
                 }
@@ -368,8 +375,28 @@ impl ReasoningGraph
                 }
                 T::ProofReused { original_event, .. } =>
                     link(*original_event, node_id, EdgeKind::ProofReuse, Some(event.id), &mut graph),
-                T::QueryFinished { .. } | T::QueryFailed { .. } =>
-                    link(node_id, query_id, EdgeKind::Return, Some(event.id), &mut graph),
+                T::QueryFinished { result } =>
+                {
+                    if let Some(root) = graph.nodes.iter_mut().find(|node| node.id == query_id)
+                    {
+                        if let GraphNodeKind::Query { outcome, .. } = &mut root.kind
+                        {
+                            *outcome = QueryOutcome::Value(*result);
+                        }
+                    }
+                    link(node_id, query_id, EdgeKind::Return, Some(event.id), &mut graph);
+                }
+                T::QueryFailed { message } =>
+                {
+                    if let Some(root) = graph.nodes.iter_mut().find(|node| node.id == query_id)
+                    {
+                        if let GraphNodeKind::Query { outcome, .. } = &mut root.kind
+                        {
+                            *outcome = QueryOutcome::Error { message: message.clone() };
+                        }
+                    }
+                    link(node_id, query_id, EdgeKind::Return, Some(event.id), &mut graph);
+                },
                 _ => {}
             }
             let _ = ATTEMPT_BASE;
