@@ -1,8 +1,9 @@
 use crate::grammar;
 use crate::tokenizer::{Token, TokenType};
-use crate::ast::{ASTNode, build_ast, rpn, simplify_and_rewrite_rules};
+use crate::ast::{ASTNode, build_ast, rpn, rewrite_with_history};
 use crate::lexer;
-use crate::trace::EvaluationTrace;
+use crate::trace::{EvaluationTrace, TraceEventKind, Literal, ProofOrigin, SearchOutcome, ConstraintOutcome, EventId};
+use crate::report::{ExecutionReport, QueryExecution, QueryOutcome, RewriteHistory};
 
 use std::collections::{HashSet, VecDeque};
 use std::thread;
@@ -16,6 +17,10 @@ struct EvaluationCtx
     symbols_state: [ProofState;26],
     constraints: Vec<Option<Constraint>>,
     visiting: HashSet<(char, FactState)>,
+    trace: Option<EvaluationTrace>,
+    attempt_stack: Vec<u64>,
+    active_attempts: std::collections::HashMap<(char, FactState), u64>,
+    proof_events: [Option<EventId>; 52],
 }
 
 #[derive(Debug)]
@@ -29,6 +34,7 @@ pub struct System<'a>
     rules_for_symbol: [Vec<usize>;26],
     rules_for_symbol_calculated: bool,
     base_state: [ProofState;26],
+    rewrite_history: RewriteHistory,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -125,6 +131,10 @@ impl EvaluationCtx
             symbols_state: [ProofState::new(false, false); 26],
             constraints: Vec::new(),
             visiting: HashSet::new(),
+            trace: None,
+            attempt_stack: Vec::new(),
+            active_attempts: std::collections::HashMap::new(),
+            proof_events: [None; 52],
         }
     }
 }
@@ -143,12 +153,18 @@ impl<'a> System<'a>
             rules_for_symbol: std::array::from_fn(|_| Vec::new()),
             rules_for_symbol_calculated: false,
             base_state: [ProofState::new(false, false); 26],
+            rewrite_history: RewriteHistory::default(),
         }
     }
 
     pub fn add_rules(&mut self, rules: Vec<Rule<'a>>)
     {
         self.rules = rules;
+    }
+
+    pub fn rewrite_history(&self) -> &RewriteHistory
+    {
+        &self.rewrite_history
     }
 
     pub fn set_fact(&mut self, facts: Vec<char>) -> Result<(), String>
@@ -299,7 +315,7 @@ impl<'a> System<'a>
         &self.rules_for_symbol[index]
     }
 
-    fn mark_proven(eval_ctx: &mut EvaluationCtx, symbol: char, target: FactState) -> bool
+    fn mark_proven(eval_ctx: &mut EvaluationCtx, symbol: char, target: FactState, origin: ProofOrigin, causes: Vec<EventId>) -> bool
     {
         let state = &mut eval_ctx.symbols_state[symbol_to_nb(symbol)];
 
@@ -325,7 +341,39 @@ impl<'a> System<'a>
             _ => unreachable!(),
         }
 
+        let literal = Literal { symbol, positive: target == FactState::True };
+        let event = Self::emit(eval_ctx, TraceEventKind::LiteralProven { literal, origin }, causes);
+        if let Some(id) = event
+        {
+            let slot = symbol_to_nb(symbol) * 2 + usize::from(!literal.positive);
+            eval_ctx.proof_events[slot] = Some(id);
+        }
         true
+    }
+
+    fn emit(ctx: &mut EvaluationCtx, kind: TraceEventKind, causes: Vec<EventId>) -> Option<EventId>
+    {
+        let attempt_id = ctx.attempt_stack.last().copied();
+        ctx.trace.as_mut().map(|trace| trace.record(attempt_id, kind, causes))
+    }
+
+    fn mark_from_rule(ctx: &mut EvaluationCtx, symbol: char, state: FactState, rule_id: usize) -> bool
+    {
+        Self::mark_proven(ctx, symbol, state, ProofOrigin::Rule { rule_id }, Vec::new())
+    }
+
+    fn mark_from_constraint(ctx: &mut EvaluationCtx, symbol: char, state: FactState, constraint_id: usize) -> bool
+    {
+        let causes = ctx.constraints[constraint_id].as_ref().map(|clause|
+        {
+            clause.iter().filter_map(|&(other, polarity)|
+            {
+                if other == symbol { return None; }
+                let slot = symbol_to_nb(other) * 2 + usize::from(polarity);
+                ctx.proof_events[slot]
+            }).collect::<Vec<_>>()
+        }).unwrap_or_default();
+        Self::mark_proven(ctx, symbol, state, ProofOrigin::UnitPropagation { constraint_id }, causes)
     }
 
     fn do_operation(op: Operation, lhs: FactState, rhs: Option<FactState>) -> FactState
@@ -422,8 +470,8 @@ impl<'a> System<'a>
     {
         let index = symbol_to_nb(symbol);
 
-        let mut positive = eval_ctx.symbols_state[index].positive;
-        let mut negative = eval_ctx.symbols_state[index].negative;
+        let positive = eval_ctx.symbols_state[index].positive;
+        let negative = eval_ctx.symbols_state[index].negative;
 
         if !positive
         {
@@ -435,8 +483,8 @@ impl<'a> System<'a>
             self.can_prove(eval_ctx, symbol, FactState::False)?;
         }
 
-        positive = eval_ctx.symbols_state[index].positive;
-        negative = eval_ctx.symbols_state[index].negative;
+        let positive = eval_ctx.symbols_state[index].positive;
+        let negative = eval_ctx.symbols_state[index].negative;
 
         Ok(match (positive, negative)
             {
@@ -545,6 +593,7 @@ impl<'a> System<'a>
             for idx in constraint_list
             {
                 let res = self.analyze_constraint(eval_ctx, idx);
+                Self::trace_constraint(eval_ctx, idx, &res);
                 match res.0
                 {
                     ConstraintState::Satisfied => {}
@@ -555,14 +604,15 @@ impl<'a> System<'a>
                         changed_symbols.extend(changed.iter());
                     }
 
-                    ConstraintState::Contradiction =>                                 
+                    ConstraintState::Contradiction =>
                     {
-                        return Err(format!("Contradiction in constraint for constraint index {}", idx).to_string());
+                        // Conflicting evidence is recorded in the trace, but must
+                        // not prevent independent facts from being evaluated.
                     }
 
                     ConstraintState::Forced(sy, st) =>
                     {
-                        if System::mark_proven(eval_ctx, sy, st) == true
+                        if System::mark_from_constraint(eval_ctx, sy, st, idx) == true
                         {
                             changed_symbols.push_back(sy);
                         }
@@ -571,6 +621,22 @@ impl<'a> System<'a>
             }
         }
         Ok(())
+    }
+
+    fn trace_constraint(ctx: &mut EvaluationCtx, idx: usize, res: &(ConstraintState, Vec<(char, bool)>))
+    {
+        let result = match res.0
+        {
+            ConstraintState::Satisfied => ConstraintOutcome::Satisfied,
+            ConstraintState::Unresolved => ConstraintOutcome::Unresolved {
+                literals: res.1.iter().map(|&(symbol, positive)| Literal { symbol, positive }).collect(),
+            },
+            ConstraintState::Forced(symbol, state) => ConstraintOutcome::Forced {
+                literal: Literal { symbol, positive: state == FactState::True },
+            },
+            ConstraintState::Contradiction => ConstraintOutcome::Contradiction,
+        };
+        Self::emit(ctx, TraceEventKind::ConstraintEvaluated { constraint_id: idx, result }, vec![]);
     }
 
     fn conclusion_contains_goal(conclusion: &ASTNode<'a>, symbol: char, target: FactState) -> bool
@@ -619,10 +685,29 @@ impl<'a> System<'a>
         }
 
         let visiting_key = (symbol, target_state);
+        let literal = Literal { symbol, positive: target_state == FactState::True };
 
         if eval_ctx.visiting.contains(&visiting_key)
         {
+            if let Some(&previous_attempt) = eval_ctx.active_attempts.get(&visiting_key)
+            {
+                Self::emit(eval_ctx, TraceEventKind::CycleDetected { goal: literal, previous_attempt }, vec![]);
+            }
             return Ok(false);
+        }
+
+        let parent_attempt = eval_ctx.attempt_stack.last().copied();
+        let attempt_id = eval_ctx.trace.as_mut().map(|trace|
+        {
+            let id = trace.attempts;
+            trace.attempts += 1;
+            id
+        });
+        if let Some(id) = attempt_id
+        {
+            eval_ctx.attempt_stack.push(id);
+            eval_ctx.active_attempts.insert(visiting_key, id);
+            Self::emit(eval_ctx, TraceEventKind::SearchStarted { attempt_id: id, parent_attempt, goal: literal }, vec![]);
         }
 
         eval_ctx.visiting.insert(visiting_key);
@@ -651,7 +736,9 @@ impl<'a> System<'a>
                         continue;
                     }
 
+                    Self::emit(eval_ctx, TraceEventKind::RuleConsidered { rule_id: rule_idx }, vec![]);
                     let premise = self.evaluate_expression_from_idx(eval_ctx, rule_idx)?;
+                    Self::emit(eval_ctx, TraceEventKind::PremiseEvaluated { rule_id: rule_idx, result: premise.into() }, vec![]);
 
                     match premise
                     {
@@ -664,7 +751,8 @@ impl<'a> System<'a>
 
                         FactState::Contradiction =>
                         {
-                            return Err(format!("Contradiction while evaluating rule {}", rule_idx));
+                            // In a contradictory knowledge base a premise has positive support.
+                            // Keep collecting proofs; the query can then report both polarities.
                         }
                     }
                     
@@ -674,6 +762,7 @@ impl<'a> System<'a>
                         .as_deref()
                         .unwrap();
 
+                    Self::emit(eval_ctx, TraceEventKind::RuleApplied { rule_id: rule_idx }, vec![]);
                     match conclusion.token.token_type
                     {
                         TokenType::Symbol | TokenType::Not =>
@@ -682,7 +771,7 @@ impl<'a> System<'a>
 
                             if matches_goal
                             {
-                                if System::mark_proven(eval_ctx, symbol, target_state) == true
+                                if System::mark_from_rule(eval_ctx, symbol, target_state, rule_idx) == true
                                 {
                                     self.propagate_constraints_from(eval_ctx, symbol)?;
                                 }
@@ -697,13 +786,15 @@ impl<'a> System<'a>
                             {
                                 continue;
                             }
+                            Self::emit(eval_ctx, TraceEventKind::ConstraintActivated { constraint_id: rule_idx, rule_id: rule_idx }, vec![]);
 
                             let res = self.analyze_constraint(eval_ctx, rule_idx);
+                            Self::trace_constraint(eval_ctx, rule_idx, &res);
                             match res.0
                             {
                                 ConstraintState::Forced(sy, st) =>
                                 {
-                                    if System::mark_proven(eval_ctx, sy, st) == true
+                                    if System::mark_from_constraint(eval_ctx, sy, st, rule_idx) == true
                                     {
                                         self.propagate_constraints_from(eval_ctx, sy)?;
                                     }
@@ -711,8 +802,8 @@ impl<'a> System<'a>
 
                                 ConstraintState::Contradiction =>
                                 {
-                                    println!("Constraints: {:#?}", eval_ctx.constraints);
-                                    return Err(format!("Contradiction in constraint for constraint index {}", rule_idx).to_string());
+                                    // Preserve the conflict as trace data and continue
+                                    // exploring other proof paths for this query.
                                 }
 
                                 ConstraintState::Satisfied => {}
@@ -742,6 +833,17 @@ impl<'a> System<'a>
             })();
 
         eval_ctx.visiting.remove(&visiting_key);
+        if let Some(attempt_id) = attempt_id
+        {
+            let outcome = match &result
+            {
+                Ok(true) => SearchOutcome::Proven,
+                Ok(false) | Err(_) => SearchOutcome::NotProven,
+            };
+            Self::emit(eval_ctx, TraceEventKind::SearchFinished { attempt_id, outcome }, vec![]);
+            eval_ctx.active_attempts.remove(&visiting_key);
+            eval_ctx.attempt_stack.pop();
+        }
 
         result
     }
@@ -805,10 +907,8 @@ impl<'a> System<'a>
                 changed_symbols.push(symbol);
             }
 
-            if positive_after && negative_after
-            {
-                return Err(format!("Contradiction found for symbol {}", symbol));
-            }
+            // Preserve both proofs. A contradictory fact is a reportable logical
+            // outcome, not an evaluation failure.
         }
 
         Ok(changed_symbols)
@@ -880,6 +980,58 @@ impl<'a> System<'a>
             return false;
         }
         true
+    }
+
+    pub fn evaluate_traced(&self, symbol: char) -> QueryExecution
+    {
+        let mut ctx = EvaluationCtx::new();
+        ctx.symbols_state = self.base_state;
+        ctx.constraints = vec![None; self.rules.len()];
+        ctx.trace = Some(EvaluationTrace::new(symbol));
+
+        for fact in &self.facts
+        {
+            let literal = Literal { symbol: *fact, positive: true };
+            let event = Self::emit(&mut ctx, TraceEventKind::LiteralProven {
+                literal, origin: ProofOrigin::InitialFact,
+            }, vec![]);
+            if let Some(event) = event
+            {
+                ctx.proof_events[symbol_to_nb(*fact) * 2] = Some(event);
+            }
+        }
+
+        let result = self.evaluate_symbol(&mut ctx, symbol);
+        let outcome = match result
+        {
+            Ok(value) => QueryOutcome::Value(value.into()),
+            Err(message) => QueryOutcome::Error { message },
+        };
+        QueryExecution {
+            symbol, outcome,
+            trace: ctx.trace.take().unwrap(),
+        }
+    }
+
+    pub fn execution_report(&self) -> ExecutionReport
+    {
+        ExecutionReport {
+            schema_version: 1,
+            initial_facts: self.facts.clone(),
+            rewrite: self.rewrite_history.clone(),
+            queries: self.query.iter().map(|&symbol| self.evaluate_traced(symbol)).collect(),
+        }
+    }
+
+    pub fn export_execution_json(&self, path: impl AsRef<std::path::Path>) -> Result<(), Box<dyn std::error::Error>>
+    {
+        if !self.verify_system_is_init()
+        {
+            return Err("System is not initialized".into());
+        }
+        let file = std::fs::File::create(path)?;
+        serde_json::to_writer_pretty(std::io::BufWriter::new(file), &self.execution_report())?;
+        Ok(())
     }
 
     pub fn solve(&self)
@@ -989,7 +1141,7 @@ pub fn parser<'a>(system: &mut System<'a>, lines: Vec<&'a str>) -> Result<(), St
     let mut query_found = false;
     let mut asts = Vec::new();
 
-    for tokens in &mut token_list
+    for (line_index, tokens) in token_list.iter_mut().enumerate()
     {
         grammar::check_grammar(&tokens)?;	
         
@@ -1028,10 +1180,99 @@ pub fn parser<'a>(system: &mut System<'a>, lines: Vec<&'a str>) -> Result<(), St
             )?;
             continue;
         }
-        asts.push(build_ast(rpn(tokens.clone()))?);
+        let original = tokens.iter().map(|t| t.value).collect::<String>();
+        asts.push((build_ast(rpn(tokens.clone()))?, line_index + 1, original));
     }
 
-    system.add_rules(simplify_and_rewrite_rules(asts));
+    let (rules, history) = rewrite_with_history(asts);
+    system.add_rules(rules);
+    system.rewrite_history = history;
 
     Ok(())
+}
+
+impl From<FactState> for crate::trace::LogicValue
+{
+    fn from(value: FactState) -> Self
+    {
+        match value
+        {
+            FactState::True => Self::True,
+            FactState::False => Self::False,
+            FactState::Undetermined => Self::Undetermined,
+            FactState::Contradiction => Self::Contradiction,
+        }
+    }
+}
+
+#[cfg(test)]
+mod inference_tests
+{
+    use super::*;
+    use crate::trace::TraceEventKind;
+
+    fn check(input: &str, query: char) -> (FactState, QueryExecution)
+    {
+        let mut system = System::new();
+        parser(&mut system, input.lines().filter(|line| !line.trim().is_empty()).collect()).unwrap();
+        system.compute_rules_for_symbols();
+        let mut ctx = EvaluationCtx::new();
+        ctx.symbols_state = system.base_state;
+        ctx.constraints = vec![None; system.rules.len()];
+        let value = system.evaluate_symbol(&mut ctx, query).unwrap();
+        let traced = system.evaluate_traced(query);
+        (value, traced)
+    }
+
+    #[test]
+    fn contradicting_dependencies_do_not_abort_queries()
+    {
+        let input = "A<=>B+C\nD=>E+F+G\nB=>!(C|D)\nE=>!F\n=ABDE\n?CDEFG";
+        let (c, trace) = check(input, 'C');
+        assert_eq!(c, FactState::Contradiction);
+        assert!(trace.trace.events.iter().any(|event|
+            matches!(event.kind, TraceEventKind::SearchStarted { .. })));
+        assert_eq!(check(input, 'D').0, FactState::Contradiction);
+        assert_eq!(check(input, 'F').0, FactState::Contradiction);
+    }
+
+    #[test]
+    fn forced_or_literature_and_ambiguous_or()
+    {
+        let input = "A=>B|C\nD=>!C\nA=>M|N\n=AD\n?BCMN";
+        assert_eq!(check(input, 'B').0, FactState::True);
+        assert_eq!(check(input, 'C').0, FactState::False);
+        assert_eq!(check(input, 'M').0, FactState::Undetermined);
+        assert_eq!(check(input, 'N').0, FactState::Undetermined);
+    }
+
+    #[test]
+    fn preserves_rewrite_versions()
+    {
+        let input = "A<=>B+C\n=A\n?B";
+        let mut system = System::new();
+        parser(&mut system, input.lines().collect()).unwrap();
+        let history = system.rewrite_history();
+        assert_eq!(history.original_rules.len(), 1);
+        assert_eq!(history.normalized_rules.len(), 3);
+        assert!(history.transformations.iter().any(|t|
+            matches!(t.kind, crate::report::TransformationKind::SplitBiconditional)));
+        assert!(history.transformations.iter().any(|t|
+            matches!(t.kind, crate::report::TransformationKind::SplitAndConclusion)));
+    }
+
+    #[test]
+    fn json_report_round_trip()
+    {
+        let input = "A=>B\n=A\n?B";
+        let mut system = System::new();
+        parser(&mut system, input.lines().collect()).unwrap();
+        system.compute_rules_for_symbols();
+        let report = system.execution_report();
+        let encoded = serde_json::to_string(&report).unwrap();
+        let decoded: crate::report::ExecutionReport = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded.schema_version, 1);
+        assert_eq!(decoded.queries.len(), 1);
+        assert!(!decoded.queries[0].trace.events.is_empty());
+    }
 }

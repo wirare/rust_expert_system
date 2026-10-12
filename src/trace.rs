@@ -34,6 +34,8 @@ pub struct EvaluationTrace
 {
     pub query: char,
     pub events: Vec<TraceEvent>,
+    #[serde(default)]
+    pub attempts: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -140,4 +142,19 @@ pub enum ProofOrigin
     {
         constraint_id: ConstraintId,
     },
+}
+
+impl EvaluationTrace
+{
+    pub fn new(query: char) -> Self
+    {
+        Self { query, events: Vec::new(), attempts: 0 }
+    }
+
+    pub fn record(&mut self, attempt_id: Option<AttemptId>, kind: TraceEventKind, causes: Vec<EventId>) -> EventId
+    {
+        let id = self.events.len() as EventId;
+        self.events.push(TraceEvent { id, attempt_id, kind, causes });
+        id
+    }
 }

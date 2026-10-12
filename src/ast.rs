@@ -1,5 +1,6 @@
 use std::{collections::{HashMap, HashSet, VecDeque}, mem::swap, sync::LazyLock};
 use crate::{system::Rule, tokenizer::{Token, TokenMask, TokenType}};
+use crate::report::{RewriteHistory, OriginalRule, RuleVersion, NormalizedRule, RuleTransformation, TransformationKind};
 
 #[derive(Hash, PartialEq)]
 pub enum Assoc
@@ -481,6 +482,159 @@ fn split_not_xor_in_conc_ast(node: ASTNode) -> [ASTNode; 2]
             ),
         ),
     ]
+}
+
+pub fn format_ast(node: &ASTNode) -> String
+{
+    let left = || format_ast(node.left.as_deref().expect("AST left operand"));
+    let right = || format_ast(node.right.as_deref().expect("AST right operand"));
+    match node.token.token_type
+    {
+        TokenType::Symbol => node.token.value.to_string(),
+        TokenType::Not => format!("!{}", left()),
+        TokenType::Then => format!("({} => {})", left(), right()),
+        TokenType::Iff => format!("({} <=> {})", left(), right()),
+        _ => format!("({} {} {})", left(), node.token.value, right()),
+    }
+}
+
+pub fn rewrite_with_history<'a>(asts: Vec<(ASTNode<'a>, usize, String)>)
+    -> (Vec<Rule<'a>>, RewriteHistory)
+{
+    let mut history = RewriteHistory::default();
+    let mut queue: VecDeque<(ASTNode<'a>, usize, u64)> = VecDeque::new();
+
+    for (ast, line, expression) in asts
+    {
+        let original_rule_id = history.original_rules.len();
+        history.original_rules.push(OriginalRule {
+            id: original_rule_id,
+            source_line: line,
+            expression,
+        });
+        let version_id = history.rule_versions.len() as u64;
+        history.rule_versions.push(RuleVersion {
+            id: version_id,
+            original_rule_id,
+            expression: format_ast(&ast),
+        });
+        queue.push_back((ast, original_rule_id, version_id));
+    }
+
+    let then_token = Token::new(TokenType::Then, "=>");
+    let mut final_rules = Vec::new();
+
+    while let Some((ast, original_id, previous_version)) = queue.pop_front()
+    {
+        let mut kind = None;
+        let mut rewritten = Vec::new();
+
+        if ast.token.token_type == TokenType::Iff
+        {
+            kind = Some(TransformationKind::SplitBiconditional);
+            rewritten.extend(split_iff_ast(ast.clone()));
+        }
+        else
+        {
+            let premise = ast.left.as_deref().unwrap().clone();
+            let conclusion = ast.right.as_deref().unwrap().clone();
+            match conclusion.token.token_type
+            {
+                TokenType::And =>
+                {
+                    kind = Some(TransformationKind::SplitAndConclusion);
+                    let [a, b] = split_and_conc_ast(conclusion);
+                    rewritten.push(ASTNode::with_children(then_token, premise.clone(), a));
+                    rewritten.push(ASTNode::with_children(then_token, premise, b));
+                }
+                TokenType::Or =>
+                {
+                    let check = conclusion.contain_token_mask(TokenType::And.into(), 0);
+                    if check.0 && check.1 == 1
+                    {
+                        kind = Some(TransformationKind::DistributeOr);
+                        rewritten.push(ASTNode::with_children(then_token, premise,
+                            distribute_or_inside_and_exp_in_conc_ast(conclusion)));
+                    }
+                }
+                TokenType::Xor =>
+                {
+                    kind = Some(TransformationKind::ExpandXor);
+                    let [a, b] = split_xor_in_conc_ast(conclusion);
+                    rewritten.push(ASTNode::with_children(then_token, premise.clone(), a));
+                    rewritten.push(ASTNode::with_children(then_token, premise, b));
+                }
+                TokenType::Not =>
+                {
+                    let inner = conclusion.left.as_deref().unwrap();
+                    match inner.token.token_type
+                    {
+                        TokenType::Xor =>
+                        {
+                            kind = Some(TransformationKind::ExpandXor);
+                            let [a, b] = split_not_xor_in_conc_ast(conclusion);
+                            rewritten.push(ASTNode::with_children(then_token, premise.clone(), a));
+                            rewritten.push(ASTNode::with_children(then_token, premise, b));
+                        }
+                        TokenType::Or =>
+                        {
+                            kind = Some(TransformationKind::DeMorgan);
+                            rewritten.push(ASTNode::with_children(then_token, premise,
+                                rewrite_not_or_in_conc_ast(conclusion)));
+                        }
+                        TokenType::And =>
+                        {
+                            kind = Some(TransformationKind::DeMorgan);
+                            rewritten.push(ASTNode::with_children(then_token, premise,
+                                rewrite_not_and_in_conc_ast(conclusion)));
+                        }
+                        TokenType::Not =>
+                        {
+                            kind = Some(TransformationKind::EliminateDoubleNegation);
+                            rewritten.push(ASTNode::with_children(then_token, premise,
+                                inner.left.as_deref().unwrap().clone()));
+                        }
+                        _ => {}
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        if let Some(kind) = kind
+        {
+            let mut outputs = Vec::new();
+            for node in rewritten
+            {
+                let version_id = history.rule_versions.len() as u64;
+                history.rule_versions.push(RuleVersion {
+                    id: version_id,
+                    original_rule_id: original_id,
+                    expression: format_ast(&node),
+                });
+                outputs.push(version_id);
+                queue.push_back((node, original_id, version_id));
+            }
+            let id = history.transformations.len() as u64;
+            history.transformations.push(RuleTransformation {
+                id, kind, inputs: vec![previous_version], outputs,
+            });
+        }
+        else
+        {
+            let symbols = ast.right.as_ref().unwrap().symbols_contained();
+            let id = final_rules.len();
+            history.normalized_rules.push(NormalizedRule {
+                id,
+                original_rule_id: original_id,
+                version_id: previous_version,
+                expression: format_ast(&ast),
+            });
+            final_rules.push((ast, symbols));
+        }
+    }
+
+    (final_rules, history)
 }
 
 pub fn simplify_and_rewrite_rules(asts: Vec<ASTNode>) -> Vec<Rule>
