@@ -81,6 +81,20 @@ impl ExpertSystemApp
         }
     }
 
+    /// Fact checkbox changes are executed immediately, using the editor's
+    /// current text and the selected sequential/parallel mode.
+    fn on_facts_changed(&mut self, context: egui::Context)
+    {
+        if self.document.has_input() && !self.runner.is_running()
+        {
+            self.run_engine(context);
+        }
+        else
+        {
+            self.runner.clear();
+        }
+    }
+
     fn run_engine(&mut self, context: egui::Context)
     {
         let mode = if self.parallel
@@ -150,10 +164,11 @@ impl eframe::App for ExpertSystemApp
             });
 
             ui.add_space(7.0);
-            if views::fact_editor(ui, &mut self.facts, !self.runner.is_running())
+            let fact_controls_enabled = !self.runner.is_running() && self.document.has_input();
+            if views::fact_editor(ui, &mut self.facts, fact_controls_enabled)
             {
-                // These changes affect only the next solver run.
-                self.runner.clear();
+                // Re-evaluate immediately, including after Reset to source.
+                self.on_facts_changed(ui.ctx().clone());
             }
 
             if let Some(error) = &self.file_error
@@ -208,6 +223,76 @@ impl eframe::App for ExpertSystemApp
                         }
                     });
                 });
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests
+{
+    use super::*;
+    use super::super::runner::RunState;
+
+    #[test]
+    fn toggling_fact_starts_engine_and_updates_result()
+    {
+        let mut app = ExpertSystemApp::default();
+        app.document.text = "A=>B\n=A\n?B".to_owned();
+        app.facts = FactControls::from_document(&app.document.text);
+
+        // The file still contains '=A', but the runtime checkbox disables A.
+        app.facts.set_enabled(0, false);
+        app.on_facts_changed(egui::Context::default());
+        assert!(matches!(app.runner.state, RunState::Running));
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while app.runner.is_running() && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            app.runner.poll();
+        }
+
+        match &app.runner.state
+        {
+            RunState::Completed(report) =>
+            {
+                assert_eq!(report.results.len(), 1);
+                assert_eq!(report.results[0].value, Ok(crate::trace::LogicValue::False));
+            }
+            RunState::Failed(error) => panic!("Unexpected inference failure: {error}"),
+            _ => panic!("Auto-run did not finish"),
+        }
+
+        assert_eq!(app.document.text, "A=>B\n=A\n?B");
+    }
+
+    #[test]
+    fn resetting_facts_can_rerun_in_parallel()
+    {
+        let mut app = ExpertSystemApp::default();
+        app.parallel = true;
+        app.document.text = "A=>B\n=A\n?B".to_owned();
+        app.facts = FactControls::from_document(&app.document.text);
+        app.facts.set_enabled(0, false);
+        app.facts.restore_source();
+        app.on_facts_changed(egui::Context::default());
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while app.runner.is_running() && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            app.runner.poll();
+        }
+
+        match &app.runner.state
+        {
+            RunState::Completed(report) =>
+            {
+                assert_eq!(report.mode, SolveMode::Parallel);
+                assert_eq!(report.results[0].value, Ok(crate::trace::LogicValue::True));
+            }
+            RunState::Failed(error) => panic!("Unexpected inference failure: {error}"),
+            _ => panic!("Auto-run did not finish"),
         }
     }
 }
