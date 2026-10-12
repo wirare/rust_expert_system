@@ -1360,4 +1360,57 @@ mod inference_tests
         assert_eq!(decoded.queries.len(), 1);
         assert!(!decoded.queries[0].trace.events.is_empty());
     }
+    #[test]
+    fn graph_report_contains_actual_justification_edges()
+    {
+        let input = "A=>B|C\nD=>!C\n=AD\n?B";
+        let mut system = System::new();
+        parser(&mut system, input.lines().collect()).unwrap();
+        system.compute_rules_for_symbols();
+        let report = system.execution_report();
+        let query = &report.queries[0];
+        assert!(matches!(query.outcome, QueryOutcome::Value(crate::trace::LogicValue::True)));
+        let events = &query.trace.events;
+        let activation = events.iter().find(|e| matches!(e.kind, TraceEventKind::ConstraintActivated { .. })).expect("constraint activated");
+        let deduction = events.iter().find(|e| matches!(e.kind, TraceEventKind::LiteralProven {
+            literal: Literal { symbol: 'B', positive: true }, ..
+        })).expect("B proven");
+        assert!(deduction.causes.contains(&activation.id), "forced proof must depend on activation");
+        assert!(deduction.causes.iter().any(|cause| events.iter().any(|e| e.id == *cause &&
+            matches!(e.kind, TraceEventKind::LiteralProven { literal: Literal {symbol:'C', positive:false}, .. }))), "forced proof must depend on !C");
+        assert!(query.graph.edges.iter().any(|edge| edge.to == deduction.id &&
+            edge.from == activation.id), "graph must connect the proof sources");
+    }
+
+    #[test]
+    fn graph_contains_rewrite_history_and_refs()
+    {
+        let input = "A<=>B+C\n=A\n?B";
+        let mut system = System::new();
+        parser(&mut system, input.lines().collect()).unwrap();
+        system.compute_rules_for_symbols();
+        let report = system.execution_report();
+        assert!(!report.rewrite_graph.edges.is_empty());
+        assert_eq!(report.rewrite_graph.nodes.iter().filter(|node| matches!(node.kind,
+            crate::report::GraphNodeKind::Transformation { .. })).count(),
+            report.rewrite.transformations.len());
+        let serialized = serde_json::to_string(&report).unwrap();
+        let decoded: crate::report::ExecutionReport = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(decoded.queries[0].graph.edges.len(), report.queries[0].graph.edges.len());
+    }
+
+    #[test]
+    fn cached_fact_emits_proof_reuse()
+    {
+        let input = "A=>B\n=A\n?B";
+        let mut system = System::new();
+        parser(&mut system, input.lines().collect()).unwrap();
+        system.compute_rules_for_symbols();
+        let trace = system.evaluate_traced('B').trace;
+        assert!(trace.events.iter().any(|event|
+            matches!(event.kind, TraceEventKind::ProofReused {
+                literal: Literal { symbol: 'A', positive: true }, ..
+            })));
+    }
+
 }
