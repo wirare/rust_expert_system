@@ -5,7 +5,7 @@ use std::sync::mpsc::{self, Receiver, TryRecvError};
 
 use eframe::egui;
 
-use crate::engine::{RunReport, SolveMode, run_source};
+use crate::engine::{RunReport, SolveMode, run_source_with_facts};
 
 pub enum RunState
 {
@@ -63,7 +63,13 @@ impl RunController
 
     /// Spawn a worker that owns the source snapshot. No borrowed AST or
     /// EvaluationCtx ever crosses this thread boundary.
-    pub fn start(&mut self, source: String, mode: SolveMode, context: egui::Context)
+    pub fn start(
+        &mut self,
+        source: String,
+        mode: SolveMode,
+        active_facts: [bool; 26],
+        context: egui::Context,
+    )
     {
         if self.is_running()
         {
@@ -78,7 +84,7 @@ impl RunController
         {
             let result = std::panic::catch_unwind(||
             {
-                run_source(&source, mode)
+                run_source_with_facts(&source, mode, active_facts)
             });
 
             let result = match result
