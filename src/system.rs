@@ -23,7 +23,7 @@ struct EvaluationCtx
     proof_events: [Option<EventId>; 52],
     constraint_activation: Vec<Option<EventId>>,
     last_evidence: Vec<EventId>,
-    last_constraint_event: Option<EventId>,
+    constraint_last_evaluation: Vec<Option<EventId>>,
 }
 
 #[derive(Debug)]
@@ -140,7 +140,7 @@ impl EvaluationCtx
             proof_events: [None; 52],
             constraint_activation: Vec::new(),
             last_evidence: Vec::new(),
-            last_constraint_event: None,
+            constraint_last_evaluation: Vec::new(),
         }
     }
 }
@@ -375,7 +375,7 @@ impl<'a> System<'a>
         {
             causes.push(id);
         }
-        if let Some(id) = ctx.last_constraint_event
+        if let Some(id) = ctx.constraint_last_evaluation.get(constraint_id).copied().flatten()
         {
             causes.push(id);
         }
@@ -500,10 +500,24 @@ impl<'a> System<'a>
         {
             self.can_prove(eval_ctx, symbol, FactState::True)?;
         }
+        else if let Some(id) = eval_ctx.proof_events[index * 2]
+        {
+            Self::emit(eval_ctx, TraceEventKind::ProofReused {
+                literal: Literal { symbol, positive: true },
+                original_event: id,
+            }, vec![id]);
+        }
 
         if !negative
         {
             self.can_prove(eval_ctx, symbol, FactState::False)?;
+        }
+        else if let Some(id) = eval_ctx.proof_events[index * 2 + 1]
+        {
+            Self::emit(eval_ctx, TraceEventKind::ProofReused {
+                literal: Literal { symbol, positive: false },
+                original_event: id,
+            }, vec![id]);
         }
 
         let positive = eval_ctx.symbols_state[index].positive;
@@ -668,7 +682,8 @@ impl<'a> System<'a>
             ConstraintState::Contradiction => ConstraintOutcome::Contradiction,
         };
         let causes = ctx.constraint_activation.get(idx).copied().flatten().into_iter().collect();
-        ctx.last_constraint_event = Self::emit(ctx, TraceEventKind::ConstraintEvaluated { constraint_id: idx, result }, causes);
+        let event = Self::emit(ctx, TraceEventKind::ConstraintEvaluated { constraint_id: idx, result }, causes);
+        if let Some(slot) = ctx.constraint_last_evaluation.get_mut(idx) { *slot = event; }
     }
 
     fn conclusion_contains_goal(conclusion: &ASTNode<'a>, symbol: char, target: FactState) -> bool
@@ -1050,6 +1065,7 @@ impl<'a> System<'a>
         ctx.symbols_state = self.base_state;
         ctx.constraints = vec![None; self.rules.len()];
         ctx.constraint_activation = vec![None; self.rules.len()];
+        ctx.constraint_last_evaluation = vec![None; self.rules.len()];
         ctx.trace = Some(EvaluationTrace::new(symbol));
 
         for fact in &self.facts
