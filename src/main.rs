@@ -12,7 +12,7 @@ use system::System;
 
 use crate::system::parser;
 
-fn main() -> Result<(), std::io::Error>
+fn main() -> Result<(), Box<dyn std::error::Error>>
 {
     let parsing = std::time::Instant::now();
     let args: Vec<String> = env::args().collect();
@@ -48,8 +48,7 @@ fn main() -> Result<(), std::io::Error>
 
     if args.len() >= 4 && args[2] == "--report"
     {
-        system.export_execution_json(&args[3])
-            .map_err(std::io::Error::other)?;
+        system.export_execution_json(&args[3])?;
         println!("Wrote reasoning report to {}", args[3]);
     }
     Ok(())
