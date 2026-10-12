@@ -858,10 +858,23 @@ impl<'a> System<'a>
                             }
                             let mut literals: Vec<_> = eval_ctx.constraints[rule_idx].as_ref().unwrap().iter().map(|&(symbol, positive)| Literal { symbol, positive }).collect();
                             literals.sort_by_key(|lit| (lit.symbol, lit.positive));
-                            let activated = Self::emit(eval_ctx, TraceEventKind::ConstraintActivated { constraint_id: rule_idx, rule_id: rule_idx, literals }, applied.into_iter().collect());
-                            if let Some(slot) = eval_ctx.constraint_activation.get_mut(rule_idx)
+                            // Re-evaluating a previously active clause is not a new activation.
+                            // Keep the original activation event as the stable justification.
+                            if eval_ctx.constraint_activation.get(rule_idx).copied().flatten().is_none()
                             {
-                                *slot = activated;
+                                let activated = Self::emit(
+                                    eval_ctx,
+                                    TraceEventKind::ConstraintActivated {
+                                        constraint_id: rule_idx,
+                                        rule_id: rule_idx,
+                                        literals,
+                                    },
+                                    applied.into_iter().collect(),
+                                );
+                                if let Some(slot) = eval_ctx.constraint_activation.get_mut(rule_idx)
+                                {
+                                    *slot = activated;
+                                }
                             }
 
                             let res = self.analyze_constraint(eval_ctx, rule_idx);
@@ -917,7 +930,17 @@ impl<'a> System<'a>
                 Ok(false) => SearchOutcome::NotProven,
                 Err(message) => SearchOutcome::Error { message: message.clone() },
             };
-            Self::emit(eval_ctx, TraceEventKind::SearchFinished { attempt_id, outcome }, vec![]);
+            let proof_slot = symbol_to_nb(symbol) * 2
+                + usize::from(target_state == FactState::False);
+            let causes = if matches!(result, Ok(true))
+            {
+                eval_ctx.proof_events[proof_slot].into_iter().collect()
+            }
+            else
+            {
+                Vec::new()
+            };
+            Self::emit(eval_ctx, TraceEventKind::SearchFinished { attempt_id, outcome }, causes);
             eval_ctx.active_attempts.remove(&visiting_key);
             eval_ctx.attempt_stack.pop();
         }
@@ -1081,11 +1104,29 @@ impl<'a> System<'a>
         }
 
         let result = self.evaluate_symbol(&mut ctx, symbol);
-        let final_causes = ctx.last_evidence.clone();
+        // The final answer must depend on evidence for this query, not on an
+        // unrelated expression evaluated last by a recursive search.
+        let fact_slot = symbol_to_nb(symbol) * 2;
+        let final_causes: Vec<EventId> = [
+            ctx.proof_events[fact_slot],
+            ctx.proof_events[fact_slot + 1],
+        ].into_iter().flatten().collect();
         match &result
         {
-            Ok(value) => { Self::emit(&mut ctx, TraceEventKind::QueryFinished { result: (*value).into() }, final_causes); }
-            Err(message) => { Self::emit(&mut ctx, TraceEventKind::QueryFailed { message: message.clone() }, Vec::new()); }
+            Ok(value) => {
+                Self::emit(
+                    &mut ctx,
+                    TraceEventKind::QueryFinished { result: (*value).into() },
+                    final_causes,
+                );
+            }
+            Err(message) => {
+                Self::emit(
+                    &mut ctx,
+                    TraceEventKind::QueryFailed { message: message.clone() },
+                    Vec::new(),
+                );
+            }
         }
         let outcome = match result
         {
@@ -1100,7 +1141,7 @@ impl<'a> System<'a>
     pub fn execution_report(&self) -> ExecutionReport
     {
         ExecutionReport {
-            schema_version: 1,
+            schema_version: 2,
             initial_facts: self.facts.clone(),
             rewrite: self.rewrite_history.clone(),
             rewrite_graph: crate::report::ReasoningGraph::from_rewrite(&self.rewrite_history),
@@ -1115,7 +1156,9 @@ impl<'a> System<'a>
             return Err("System is not initialized".into());
         }
         let file = std::fs::File::create(path)?;
-        serde_json::to_writer_pretty(std::io::BufWriter::new(file), &self.execution_report())?;
+        // JSON is an interchange format. Compact encoding avoids tens of
+        // thousands of indentation-only lines for large execution traces.
+        serde_json::to_writer(std::io::BufWriter::new(file), &self.execution_report())?;
         Ok(())
     }
 
