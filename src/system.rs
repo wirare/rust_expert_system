@@ -858,10 +858,23 @@ impl<'a> System<'a>
                             }
                             let mut literals: Vec<_> = eval_ctx.constraints[rule_idx].as_ref().unwrap().iter().map(|&(symbol, positive)| Literal { symbol, positive }).collect();
                             literals.sort_by_key(|lit| (lit.symbol, lit.positive));
-                            let activated = Self::emit(eval_ctx, TraceEventKind::ConstraintActivated { constraint_id: rule_idx, rule_id: rule_idx, literals }, applied.into_iter().collect());
-                            if let Some(slot) = eval_ctx.constraint_activation.get_mut(rule_idx)
+                            // Re-evaluating a previously active clause is not a new activation.
+                            // Keep the original activation event as the stable justification.
+                            if eval_ctx.constraint_activation.get(rule_idx).copied().flatten().is_none()
                             {
-                                *slot = activated;
+                                let activated = Self::emit(
+                                    eval_ctx,
+                                    TraceEventKind::ConstraintActivated {
+                                        constraint_id: rule_idx,
+                                        rule_id: rule_idx,
+                                        literals,
+                                    },
+                                    applied.into_iter().collect(),
+                                );
+                                if let Some(slot) = eval_ctx.constraint_activation.get_mut(rule_idx)
+                                {
+                                    *slot = activated;
+                                }
                             }
 
                             let res = self.analyze_constraint(eval_ctx, rule_idx);
@@ -917,7 +930,17 @@ impl<'a> System<'a>
                 Ok(false) => SearchOutcome::NotProven,
                 Err(message) => SearchOutcome::Error { message: message.clone() },
             };
-            Self::emit(eval_ctx, TraceEventKind::SearchFinished { attempt_id, outcome }, vec![]);
+            let proof_slot = symbol_to_nb(symbol) * 2
+                + usize::from(target_state == FactState::False);
+            let causes = if matches!(&result, Ok(true))
+            {
+                eval_ctx.proof_events[proof_slot].into_iter().collect()
+            }
+            else
+            {
+                Vec::new()
+            };
+            Self::emit(eval_ctx, TraceEventKind::SearchFinished { attempt_id, outcome }, causes);
             eval_ctx.active_attempts.remove(&visiting_key);
             eval_ctx.attempt_stack.pop();
         }
@@ -1020,6 +1043,9 @@ impl<'a> System<'a>
             }
         };
 
+        // Stable traversal order makes the trace reproducible across runs.
+        unresolved.sort_unstable();
+
         if satisfied
         {
             return (ConstraintState::Satisfied, unresolved);
@@ -1081,11 +1107,29 @@ impl<'a> System<'a>
         }
 
         let result = self.evaluate_symbol(&mut ctx, symbol);
-        let final_causes = ctx.last_evidence.clone();
+        // The final answer must depend on evidence for this query, not on an
+        // unrelated expression evaluated last by a recursive search.
+        let fact_slot = symbol_to_nb(symbol) * 2;
+        let final_causes: Vec<EventId> = [
+            ctx.proof_events[fact_slot],
+            ctx.proof_events[fact_slot + 1],
+        ].into_iter().flatten().collect();
         match &result
         {
-            Ok(value) => { Self::emit(&mut ctx, TraceEventKind::QueryFinished { result: (*value).into() }, final_causes); }
-            Err(message) => { Self::emit(&mut ctx, TraceEventKind::QueryFailed { message: message.clone() }, Vec::new()); }
+            Ok(value) => {
+                Self::emit(
+                    &mut ctx,
+                    TraceEventKind::QueryFinished { result: (*value).into() },
+                    final_causes,
+                );
+            }
+            Err(message) => {
+                Self::emit(
+                    &mut ctx,
+                    TraceEventKind::QueryFailed { message: message.clone() },
+                    Vec::new(),
+                );
+            }
         }
         let outcome = match result
         {
@@ -1100,7 +1144,7 @@ impl<'a> System<'a>
     pub fn execution_report(&self) -> ExecutionReport
     {
         ExecutionReport {
-            schema_version: 1,
+            schema_version: 2,
             initial_facts: self.facts.clone(),
             rewrite: self.rewrite_history.clone(),
             rewrite_graph: crate::report::ReasoningGraph::from_rewrite(&self.rewrite_history),
@@ -1108,15 +1152,38 @@ impl<'a> System<'a>
         }
     }
 
-    pub fn export_execution_json(&self, path: impl AsRef<std::path::Path>) -> Result<(), Box<dyn std::error::Error>>
+    fn write_execution_report(
+        &self,
+        path: impl AsRef<std::path::Path>,
+        pretty: bool,
+    ) -> Result<(), Box<dyn std::error::Error>>
     {
         if !self.verify_system_is_init()
         {
             return Err("System is not initialized".into());
         }
         let file = std::fs::File::create(path)?;
-        serde_json::to_writer_pretty(std::io::BufWriter::new(file), &self.execution_report())?;
+        let writer = std::io::BufWriter::new(file);
+        let report = self.execution_report();
+        if pretty
+        {
+            serde_json::to_writer_pretty(writer, &report)?;
+        }
+        else
+        {
+            serde_json::to_writer(writer, &report)?;
+        }
         Ok(())
+    }
+
+    pub fn export_execution_json(&self, path: impl AsRef<std::path::Path>) -> Result<(), Box<dyn std::error::Error>>
+    {
+        self.write_execution_report(path, false)
+    }
+
+    pub fn export_execution_json_pretty(&self, path: impl AsRef<std::path::Path>) -> Result<(), Box<dyn std::error::Error>>
+    {
+        self.write_execution_report(path, true)
     }
 
     pub fn solve(&self)
@@ -1356,7 +1423,7 @@ mod inference_tests
         let report = system.execution_report();
         let encoded = serde_json::to_string(&report).unwrap();
         let decoded: crate::report::ExecutionReport = serde_json::from_str(&encoded).unwrap();
-        assert_eq!(decoded.schema_version, 1);
+        assert_eq!(decoded.schema_version, 2);
         assert_eq!(decoded.queries.len(), 1);
         assert!(!decoded.queries[0].trace.events.is_empty());
     }
@@ -1379,8 +1446,22 @@ mod inference_tests
         assert!(deduction.causes.iter().any(|cause| activations.contains(cause)), "forced proof must depend on activation");
         assert!(deduction.causes.iter().any(|cause| events.iter().any(|e| e.id == *cause &&
             matches!(e.kind, TraceEventKind::LiteralProven { literal: Literal {symbol:'C', positive:false}, .. }))), "forced proof must depend on !C");
-        assert!(query.graph.edges.iter().any(|edge| edge.to == deduction.id &&
-            activations.contains(&edge.from)), "graph must connect the proof sources");
+        let clause_id = 3_000_000_000 + events.iter().find_map(|e| {
+            if let TraceEventKind::ConstraintActivated { constraint_id, .. } = e.kind
+            {
+                Some(constraint_id as u64)
+            }
+            else { None }
+        }).unwrap();
+        assert!(query.graph.edges.iter().any(|edge| edge.from == clause_id &&
+            edge.to == deduction.id && edge.kind == crate::report::EdgeKind::UnitPropagation),
+            "semantic graph must connect the active clause to the deduction");
+        let refutation = events.iter().find(|e| matches!(e.kind, TraceEventKind::LiteralProven {
+            literal: Literal { symbol: 'C', positive: false }, ..
+        })).unwrap();
+        assert!(query.graph.edges.iter().any(|edge| edge.from == refutation.id &&
+            edge.to == clause_id && edge.kind == crate::report::EdgeKind::Justification),
+            "semantic graph must connect the explicit refutation to the clause");
     }
 
     #[test]
@@ -1412,6 +1493,55 @@ mod inference_tests
             matches!(event.kind, TraceEventKind::ProofReused {
                 literal: Literal { symbol: 'A', positive: true }, ..
             })));
+    }
+
+    #[test]
+    fn query_outcome_evidence_is_query_specific()
+    {
+        let input = "A=>B\nC=>!B\n=AC\n?B";
+        let mut system = System::new();
+        parser(&mut system, input.lines().collect()).unwrap();
+        system.compute_rules_for_symbols();
+        let trace = system.evaluate_traced('B').trace;
+        let last = trace.events.last().unwrap();
+        assert!(matches!(last.kind, TraceEventKind::QueryFinished {
+            result: crate::trace::LogicValue::Contradiction
+        }));
+        let mut evidence = trace.events.iter().filter_map(|event| {
+            match &event.kind {
+                TraceEventKind::LiteralProven { literal: Literal { symbol:'B', .. }, .. } =>
+                    Some(event.id),
+                _ => None,
+            }
+        }).collect::<Vec<_>>();
+        evidence.sort_unstable();
+        let mut recorded = last.causes.clone();
+        recorded.sort_unstable();
+        assert_eq!(recorded, evidence, "a contradiction needs both signed proofs");
+    }
+
+    #[test]
+    fn complex_input_export_keeps_graph_compact()
+    {
+        let input = include_str!("../test.txt");
+        let mut system = System::new();
+        parser(&mut system, input.lines().filter(|line| !line.trim().is_empty()).collect()).unwrap();
+        system.compute_rules_for_symbols();
+        let report = system.execution_report();
+        assert_eq!(report.queries.len(), 26);
+        let events: usize = report.queries.iter().map(|q| q.trace.events.len()).sum();
+        let nodes: usize = report.queries.iter().map(|q| q.graph.nodes.len()).sum();
+        assert!(events > 1_000, "the chronological trace should stay complete");
+        assert!(nodes < events / 3, "semantic graph should not duplicate each trace event");
+        let bytes = serde_json::to_vec(&report).unwrap();
+        assert!(bytes.len() < 2_000_000, "compact report should remain below 2 MB");
+        for query in &report.queries
+        {
+            let ids: HashSet<_> = query.graph.nodes.iter().map(|n| n.id).collect();
+            assert_eq!(ids.len(), query.graph.nodes.len(), "unique node IDs");
+            assert!(query.graph.edges.iter().all(|e|
+                ids.contains(&e.from) && ids.contains(&e.to)), "all edges must reference existing nodes");
+        }
     }
 
 }
