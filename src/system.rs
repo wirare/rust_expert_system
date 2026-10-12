@@ -1,6 +1,6 @@
 use crate::grammar;
 use crate::tokenizer::{Token, TokenType};
-use crate::ast::{ASTNode, build_ast, rpn, simplify_and_rewrite_rules};
+use crate::ast::{ASTNode, build_ast, rpn, rewrite_with_history};
 use crate::lexer;
 use crate::trace::{EvaluationTrace, TraceEventKind, Literal, ProofOrigin, SearchOutcome, ConstraintOutcome, EventId};
 use crate::report::{ExecutionReport, QueryExecution, QueryOutcome, RewriteHistory};
@@ -34,6 +34,7 @@ pub struct System<'a>
     rules_for_symbol: [Vec<usize>;26],
     rules_for_symbol_calculated: bool,
     base_state: [ProofState;26],
+    rewrite_history: RewriteHistory,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -152,12 +153,18 @@ impl<'a> System<'a>
             rules_for_symbol: std::array::from_fn(|_| Vec::new()),
             rules_for_symbol_calculated: false,
             base_state: [ProofState::new(false, false); 26],
+            rewrite_history: RewriteHistory::default(),
         }
     }
 
     pub fn add_rules(&mut self, rules: Vec<Rule<'a>>)
     {
         self.rules = rules;
+    }
+
+    pub fn rewrite_history(&self) -> &RewriteHistory
+    {
+        &self.rewrite_history
     }
 
     pub fn set_fact(&mut self, facts: Vec<char>) -> Result<(), String>
@@ -974,6 +981,58 @@ impl<'a> System<'a>
         true
     }
 
+    pub fn evaluate_traced(&self, symbol: char) -> QueryExecution
+    {
+        let mut ctx = EvaluationCtx::new();
+        ctx.symbols_state = self.base_state;
+        ctx.constraints = vec![None; self.rules.len()];
+        ctx.trace = Some(EvaluationTrace::new(symbol));
+
+        for fact in &self.facts
+        {
+            let literal = Literal { symbol: *fact, positive: true };
+            let event = Self::emit(&mut ctx, TraceEventKind::LiteralProven {
+                literal, origin: ProofOrigin::InitialFact,
+            }, vec![]);
+            if let Some(event) = event
+            {
+                ctx.proof_events[symbol_to_nb(*fact) * 2] = Some(event);
+            }
+        }
+
+        let result = self.evaluate_symbol(&mut ctx, symbol);
+        let outcome = match result
+        {
+            Ok(value) => QueryOutcome::Value(value.into()),
+            Err(message) => QueryOutcome::Error { message },
+        };
+        QueryExecution {
+            symbol, outcome,
+            trace: ctx.trace.take().unwrap(),
+        }
+    }
+
+    pub fn execution_report(&self) -> ExecutionReport
+    {
+        ExecutionReport {
+            schema_version: 1,
+            initial_facts: self.facts.clone(),
+            rewrite: self.rewrite_history.clone(),
+            queries: self.query.iter().map(|&symbol| self.evaluate_traced(symbol)).collect(),
+        }
+    }
+
+    pub fn export_execution_json(&self, path: impl AsRef<std::path::Path>) -> Result<(), Box<dyn std::error::Error>>
+    {
+        if !self.verify_system_is_init()
+        {
+            return Err("System is not initialized".into());
+        }
+        let file = std::fs::File::create(path)?;
+        serde_json::to_writer_pretty(std::io::BufWriter::new(file), &self.execution_report())?;
+        Ok(())
+    }
+
     pub fn solve(&self)
     {
         if !self.verify_system_is_init()
@@ -1081,7 +1140,7 @@ pub fn parser<'a>(system: &mut System<'a>, lines: Vec<&'a str>) -> Result<(), St
     let mut query_found = false;
     let mut asts = Vec::new();
 
-    for tokens in &mut token_list
+    for (line_index, tokens) in token_list.iter_mut().enumerate()
     {
         grammar::check_grammar(&tokens)?;	
         
@@ -1120,10 +1179,13 @@ pub fn parser<'a>(system: &mut System<'a>, lines: Vec<&'a str>) -> Result<(), St
             )?;
             continue;
         }
-        asts.push(build_ast(rpn(tokens.clone()))?);
+        let original = tokens.iter().map(|t| t.value).collect::<String>();
+        asts.push((build_ast(rpn(tokens.clone()))?, line_index + 1, original));
     }
 
-    system.add_rules(simplify_and_rewrite_rules(asts));
+    let (rules, history) = rewrite_with_history(asts);
+    system.add_rules(rules);
+    system.rewrite_history = history;
 
     Ok(())
 }
