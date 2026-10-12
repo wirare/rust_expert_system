@@ -5,6 +5,7 @@ use eframe::egui;
 use crate::engine::SolveMode;
 
 use super::document::SourceDocument;
+use super::facts::FactControls;
 use super::runner::RunController;
 use super::views;
 
@@ -12,9 +13,11 @@ use super::views;
 pub struct ExpertSystemApp
 {
     document: SourceDocument,
+    facts: FactControls,
     runner: RunController,
     parallel: bool,
     file_error: Option<String>,
+    confirm_discard_before_open: bool,
 }
 
 impl ExpertSystemApp
@@ -24,24 +27,57 @@ impl ExpertSystemApp
         Self::default()
     }
 
+    fn request_open(&mut self)
+    {
+        if self.document.modified
+        {
+            self.confirm_discard_before_open = true;
+        }
+        else
+        {
+            self.open_document();
+        }
+    }
+
     fn open_document(&mut self)
     {
         match SourceDocument::open_dialog()
         {
             Ok(Some(document)) =>
             {
+                // Loading another document resets runtime overrides; it does
+                // not carry facts from the previously opened file.
+                self.facts = FactControls::from_document(&document.text);
                 self.document = document;
                 self.runner.clear();
                 self.file_error = None;
             }
 
-            Ok(None) => {} // User cancelled the picker.
+            Ok(None) => {} // File chooser cancelled; keep current document.
 
             Err(error) =>
             {
-                // Keep the prior document and results on a failed open.
                 self.file_error = Some(error);
             }
+        }
+    }
+
+    fn save_document(&mut self, as_new_file: bool)
+    {
+        let result = if as_new_file
+        {
+            self.document.save_as_dialog()
+        }
+        else
+        {
+            self.document.save()
+        };
+
+        match result
+        {
+            Ok(true) => self.file_error = None,
+            Ok(false) => {} // Save dialog cancelled; leave dirty state.
+            Err(error) => self.file_error = Some(error),
         }
     }
 
@@ -57,7 +93,12 @@ impl ExpertSystemApp
         };
 
         self.file_error = None;
-        self.runner.start(self.document.text.clone(), mode, context);
+        self.runner.start(
+            self.document.text.clone(),
+            mode,
+            self.facts.enabled_mask(),
+            context,
+        );
     }
 }
 
@@ -77,16 +118,27 @@ impl eframe::App for ExpertSystemApp
                 let enabled = !self.runner.is_running();
                 if ui.add_enabled(enabled, egui::Button::new("Open .txt...")).clicked()
                 {
-                    self.open_document();
+                    self.request_open();
                 }
 
+                let can_save = enabled && self.document.has_input();
+                if ui.add_enabled(can_save, egui::Button::new("Save")).clicked()
+                {
+                    self.save_document(false);
+                }
+
+                if ui.add_enabled(can_save, egui::Button::new("Save As...")).clicked()
+                {
+                    self.save_document(true);
+                }
+
+                ui.separator();
                 ui.add_enabled_ui(enabled, |ui|
                 {
                     ui.checkbox(&mut self.parallel, "Parallel");
                 });
 
-                let can_run = enabled && self.document.has_input();
-                if ui.add_enabled(can_run, egui::Button::new("Run engine")).clicked()
+                if ui.add_enabled(can_save, egui::Button::new("Run engine")).clicked()
                 {
                     self.run_engine(ui.ctx().clone());
                 }
@@ -96,6 +148,13 @@ impl eframe::App for ExpertSystemApp
                     ui.spinner();
                 }
             });
+
+            ui.add_space(7.0);
+            if views::fact_editor(ui, &mut self.facts, !self.runner.is_running())
+            {
+                // These changes affect only the next solver run.
+                self.runner.clear();
+            }
 
             if let Some(error) = &self.file_error
             {
@@ -112,6 +171,9 @@ impl eframe::App for ExpertSystemApp
             {
                 if views::source_editor(ui, &mut self.document, !self.runner.is_running())
                 {
+                    // Source edits only update the file-derived defaults.
+                    // Explicit fact toggles continue to override those defaults.
+                    self.facts.sync_source(&self.document.text);
                     self.runner.clear();
                     self.file_error = None;
                 }
@@ -121,5 +183,31 @@ impl eframe::App for ExpertSystemApp
         {
             views::results(ui, &self.runner.state);
         });
+
+        if self.confirm_discard_before_open
+        {
+            egui::Window::new("Discard unsaved changes?")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ui.ctx(), |ui|
+                {
+                    ui.label("The current rules have unsaved edits.");
+                    ui.label("Opening another file will discard those edits.");
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui|
+                    {
+                        if ui.button("Cancel").clicked()
+                        {
+                            self.confirm_discard_before_open = false;
+                        }
+                        if ui.button("Discard and open...").clicked()
+                        {
+                            self.confirm_discard_before_open = false;
+                            self.open_document();
+                        }
+                    });
+                });
+        }
     }
 }
