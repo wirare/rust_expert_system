@@ -402,7 +402,7 @@ impl ReasoningGraph
                             for &cause in &event.causes
                             {
                                 if trace.events.get(cause as usize).is_some_and(|e|
-                                    matches!(e.kind, T::LiteralProven { .. }))
+                                    matches!(&e.kind, T::LiteralProven { .. }))
                                 {
                                     link(
                                         &mut graph, &mut known_links,
@@ -446,7 +446,7 @@ impl ReasoningGraph
                         for &cause in &event.causes
                         {
                             if trace.events.get(cause as usize).is_some_and(|e|
-                                matches!(e.kind, T::LiteralProven { .. }))
+                                matches!(&e.kind, T::LiteralProven { .. }))
                             {
                                 link(
                                     &mut graph, &mut known_links,
