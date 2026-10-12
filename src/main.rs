@@ -46,9 +46,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>>
     system.solve();
     println!("Finished normal solve in {:?}", normal_solve.elapsed());
 
-    if args.len() >= 4 && args[2] == "--report"
+    if args.len() >= 4 && (args[2] == "--report" || args[2] == "--report-pretty")
     {
-        system.export_execution_json(&args[3])?;
+        if args[2] == "--report-pretty"
+        {
+            system.export_execution_json_pretty(&args[3])?;
+        }
+        else
+        {
+            system.export_execution_json(&args[3])?;
+        }
         println!("Wrote reasoning report to {}", args[3]);
     }
     Ok(())
