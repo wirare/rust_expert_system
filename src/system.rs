@@ -530,38 +530,46 @@ impl<'a> System<'a>
 
     fn evaluate_expression_from_ast(&self, eval_ctx: &mut EvaluationCtx, exp: &ASTNode) -> Result<FactState, String>
     {
-        let lhs: FactState;
-        let mut rhs: Option<FactState> = None;
-
-        if exp.token.is_operator()
+        let mut causes = Vec::new();
+        let result = if exp.token.is_operator()
         {
-            let left = exp
-                .left
-                .as_deref()
-                .unwrap();
-
-            lhs = self.evaluate_expression_from_ast(eval_ctx, left)?;
-            
-            if exp.token.token_type != TokenType::Not
+            let lhs = self.evaluate_expression_from_ast(eval_ctx, exp.left.as_deref().unwrap())?;
+            causes.extend(eval_ctx.last_evidence.iter().copied());
+            let rhs = if exp.token.token_type != TokenType::Not
             {
-                let right = exp
-                    .right
-                    .as_deref()
-                    .unwrap();
-
-                rhs = Some(self.evaluate_expression_from_ast(eval_ctx, right)?);
+                let rhs = self.evaluate_expression_from_ast(eval_ctx, exp.right.as_deref().unwrap())?;
+                causes.extend(eval_ctx.last_evidence.iter().copied());
+                Some(rhs)
             }
-
-            return Ok(System::do_operation(exp.token.token_type.into(), lhs, rhs));
+            else { None };
+            System::do_operation(exp.token.token_type.into(), lhs, rhs)
         }
-        let symbol = exp
-            .token
-            .value
-            .chars()
-            .next()
-            .unwrap();
-
-        Ok(self.evaluate_symbol(eval_ctx, symbol)?)
+        else
+        {
+            let symbol = exp.token.value.chars().next().unwrap();
+            let state = self.evaluate_symbol(eval_ctx, symbol)?;
+            let index = symbol_to_nb(symbol) * 2;
+            if eval_ctx.symbols_state[symbol_to_nb(symbol)].positive
+            {
+                causes.extend(eval_ctx.proof_events[index]);
+            }
+            if eval_ctx.symbols_state[symbol_to_nb(symbol)].negative
+            {
+                causes.extend(eval_ctx.proof_events[index + 1]);
+            }
+            state
+        };
+        causes.sort_unstable();
+        causes.dedup();
+        if eval_ctx.trace.is_some()
+        {
+            let expression = crate::ast::format_ast(exp);
+            let event = Self::emit(eval_ctx, TraceEventKind::ExpressionEvaluated {
+                expression, result: result.into(), operand_events: causes.clone(),
+            }, causes);
+            eval_ctx.last_evidence = event.into_iter().collect();
+        }
+        Ok(result)
     }
 
     fn evaluate_expression_from_idx(&self, eval_ctx: &mut EvaluationCtx, rule_idx: usize) -> Result<FactState, String>
@@ -1057,9 +1065,10 @@ impl<'a> System<'a>
         }
 
         let result = self.evaluate_symbol(&mut ctx, symbol);
+        let final_causes = ctx.last_evidence.clone();
         match &result
         {
-            Ok(value) => { Self::emit(&mut ctx, TraceEventKind::QueryFinished { result: (*value).into() }, ctx.last_evidence.clone()); }
+            Ok(value) => { Self::emit(&mut ctx, TraceEventKind::QueryFinished { result: (*value).into() }, final_causes); }
             Err(message) => { Self::emit(&mut ctx, TraceEventKind::QueryFailed { message: message.clone() }, Vec::new()); }
         }
         let outcome = match result
