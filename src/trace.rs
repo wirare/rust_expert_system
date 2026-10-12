@@ -27,6 +27,7 @@ pub enum SearchOutcome
     Proven,
     NotProven,
     BlockedByCycle,
+    Error { message: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -63,6 +64,23 @@ pub enum TraceEventKind
         outcome: SearchOutcome,
     },
 
+    ExpressionEvaluated
+    {
+        expression: String,
+        result: LogicValue,
+        operand_events: Vec<EventId>,
+    },
+
+    QueryFinished
+    {
+        result: LogicValue,
+    },
+
+    QueryFailed
+    {
+        message: String,
+    },
+
     RuleConsidered
     {
         rule_id: RuleId,
@@ -83,6 +101,7 @@ pub enum TraceEventKind
     {
         constraint_id: ConstraintId,
         rule_id: RuleId,
+        literals: Vec<Literal>,
     },
 
     ConstraintEvaluated
