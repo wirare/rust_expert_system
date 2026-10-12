@@ -25,8 +25,10 @@ source file's `=...` declaration. Uncheck a fact to disable it, or check
 another symbol to enable it for the next run. Checkboxes affect **both
 sequential and parallel runs** without changing the editor, the original
 `=...` line, or the contents written by Save. **Reset to source** drops
-all runtime overrides. If you edit the `=...` line, source defaults update
-while intentional checkbox overrides remain in effect until reset.
+all runtime overrides. Toggling any fact or pressing Reset immediately re-runs
+the engine in the currently selected sequential/parallel mode, updating the
+results without requiring **Run engine**. If you edit the `=...` line, source
+defaults update while intentional checkbox overrides remain in effect until reset.
 
 Opening another file or editing the current source resets the results.
 Changing a fact toggle also clears old results. Input and mode controls are
