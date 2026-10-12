@@ -1186,91 +1186,127 @@ impl<'a> System<'a>
         self.write_execution_report(path, true)
     }
 
+    fn validate_ready(&self) -> Result<(), String>
+    {
+        if !self.facts_filled
+        {
+            return Err("Missing initial facts line (starting with '=')".to_owned());
+        }
+        if !self.query_filled
+        {
+            return Err("Missing query line (starting with '?')".to_owned());
+        }
+        if self.query.is_empty()
+        {
+            return Err("Query line must contain at least one symbol".to_owned());
+        }
+        if !self.rules_for_symbol_calculated
+        {
+            return Err("Rule index has not been computed".to_owned());
+        }
+        Ok(())
+    }
+
+    fn solve_one(&self, symbol: char) -> Result<crate::trace::LogicValue, String>
+    {
+        // Query-local state: independent facts, constraints, and recursion.
+        let mut ctx = EvaluationCtx::new();
+        ctx.symbols_state = self.base_state;
+        ctx.constraints = vec![None; self.rules.len()];
+        self.evaluate_symbol(&mut ctx, symbol).map(Into::into)
+    }
+
+    /// Evaluate all requested queries in order without printing or tracing.
+    /// Each query returns an independent logical value or inference error.
+    pub fn solve_results(&self) -> Result<Vec<(char, Result<crate::trace::LogicValue, String>)>, String>
+    {
+        self.validate_ready()?;
+        Ok(self.query.iter().copied().map(|symbol|
+        {
+            (symbol, self.solve_one(symbol))
+        }).collect())
+    }
+
+    /// Evaluate independent queries across scoped threads. Output order is
+    /// identical to the source query line, regardless of worker completion.
+    pub fn solve_parallel_results(&self) -> Result<Vec<(char, Result<crate::trace::LogicValue, String>)>, String>
+    {
+        self.validate_ready()?;
+
+        let workers = thread::available_parallelism()
+            .map_or(1, |value| value.get())
+            .min(self.query.len());
+        let batch_size = self.query.len().div_ceil(workers);
+
+        thread::scope(|scope|
+        {
+            let mut handles = Vec::new();
+            for chunk in self.query.chunks(batch_size)
+            {
+                handles.push(scope.spawn(move ||
+                {
+                    chunk.iter().copied().map(|symbol|
+                    {
+                        (symbol, self.solve_one(symbol))
+                    }).collect::<Vec<_>>()
+                }));
+            }
+
+            let mut results = Vec::with_capacity(self.query.len());
+            for handle in handles
+            {
+                let part = handle.join().map_err(|panic|
+                {
+                    if let Some(reason) = panic.downcast_ref::<String>()
+                    {
+                        format!("Parallel inference worker panicked: {reason}")
+                    }
+                    else if let Some(reason) = panic.downcast_ref::<&str>()
+                    {
+                        format!("Parallel inference worker panicked: {reason}")
+                    }
+                    else
+                    {
+                        "Parallel inference worker panicked".to_owned()
+                    }
+                })?;
+                results.extend(part);
+            }
+            Ok(results)
+        })
+    }
+
+    // Preserve the original CLI output, while the GUI consumes owned results.
     pub fn solve(&self)
     {
-        if !self.verify_system_is_init()
+        match self.solve_results()
         {
-            eprintln!("System is not correctly init");
-            return;
-        }
-        for symbol in self.query.clone()
-        {
-            let mut eval_ctx = EvaluationCtx::new();
-            eval_ctx.symbols_state = self.base_state;
-            eval_ctx.constraints = vec![None; self.rules.len()];
-            let result = self.evaluate_symbol(&mut eval_ctx, symbol);
-            println!("{symbol}: {result:?}");
+            Ok(results) =>
+            {
+                for (symbol, result) in results
+                {
+                    println!("{symbol}: {result:?}");
+                }
+            }
+            Err(error) => eprintln!("{error}"),
         }
     }
 
     pub fn solve_parallel(&self)
     {
-        if !self.verify_system_is_init()
+        match self.solve_parallel_results()
         {
-            eprintln!("System is not correctly init");
-            return;
-        }
-
-        if self.query.is_empty()
-        {
-            return;
-        }
-
-        let worker_limit = thread::available_parallelism()
-            .map_or(1, |count| count.get())
-            .min(self.query.len());
-
-        let batch_size = self.query.len().div_ceil(worker_limit);
-
-        thread::scope(|scope|
-        {
-            let mut handles = Vec::with_capacity(worker_limit);
-
-            for queries in self.query.chunks(batch_size)
+            Ok(results) =>
             {
-                let handle = scope.spawn(move ||
+                for (symbol, result) in results
                 {
-                    let mut eval_ctx = EvaluationCtx::new();
-
-                    let mut results = Vec::with_capacity(queries.len());
-
-                    for &symbol in queries
-                    {
-                        eval_ctx.symbols_state = self.base_state;
-                        eval_ctx.constraints = vec![None; self.rules.len()];
-                        eval_ctx.visiting.clear();
-
-                        let result = self.evaluate_symbol(&mut eval_ctx, symbol);
-
-                        results.push((symbol, result));
-                    }
-
-                    results
-                });
-
-                handles.push((queries, handle));
-            }
-
-            for (queries, handle) in handles
-            {
-                match handle.join()
-                {
-                    Ok(results) =>
-                    {
-                        for (symbol, result) in results
-                        {
-                            println!("{symbol}: {result:?}");
-                        }
-                    }
-
-                    Err(_) =>
-                    {
-                        eprintln!("A worker panicked whil evaluating queries {queries:?}");
-                    }
+                    println!("{symbol}: {result:?}");
                 }
             }
-        });
+            Err(error) => eprintln!("{error}"),
+        }
     }
+
 }
 
 pub fn parser<'a>(system: &mut System<'a>, lines: Vec<&'a str>) -> Result<(), String>
