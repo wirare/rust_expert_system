@@ -7,7 +7,7 @@ use std::collections::HashMap;
 
 use eframe::egui;
 
-use crate::report::{ExecutionReport, QueryOutcome};
+use crate::report::ExecutionReport;
 
 use super::details;
 use super::layout::{GraphLayout, NODE_HEIGHT, NODE_WIDTH};
@@ -562,12 +562,11 @@ impl GraphViewer
         // Use an actual constrained side panel. The former allocate_ui()
         // arrangement let long Debug strings increase the inspector width
         // and render off the right edge of the window.
-        egui::SidePanel::right("proof_explanation_inspector")
+        egui::Panel::right("proof_explanation_inspector")
             .resizable(true)
-            .default_width(370.0)
-            .min_width(285.0)
-            .max_width(520.0)
-            .show_inside(ui, |ui|
+            .default_size(370.0)
+            .min_size(285.0)
+            .show(ui, |ui|
             {
                 details::show(
                     ui,
