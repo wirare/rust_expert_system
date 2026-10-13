@@ -7,7 +7,7 @@ pub type ConstraintId = usize;
 
 /// Maximum retained events per query. The inference engine keeps running after
 /// this limit; only tracing stops. This bounds CLI and GUI report memory.
-pub const MAX_TRACE_EVENTS_PER_QUERY: usize = 4_000;
+pub const MAX_TRACE_EVENTS_PER_QUERY: usize = 100_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Literal
