@@ -47,8 +47,12 @@ Given fact A  -->  Applied rule A => B  -->  Derived B  -->  Query B = TRUE
 - **Colour-coded, fixed-position cards** identify initial facts, applied
   rules, OR constraints, proven literals, the query result, and explanatory
   notices. Cards contain a readable title and short description.
-- **Arrows point from evidence to its consequence.** The selected node's
-  incoming and outgoing links are highlighted and labelled.
+- **Arrows point from evidence to its consequence.** A rule above its
+  conclusion follows its own horizontal row before entering the destination
+  card from the top; a rule below enters it from the bottom. Direct neighbors
+  connect left-to-right. An obstacle-aware detour is used only when another
+  card blocks a route. The selected node's incoming and outgoing links are
+  highlighted; their meanings are listed in the inspector.
 - **Click a card** to inspect its normalized rule, original rule and source
   line, premise evaluation, signed literal, proof origin, related causal event
   IDs, connections, and underlying trace event. You can click its linked
