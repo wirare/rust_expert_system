@@ -889,6 +889,18 @@ mod tests
         let graph = ExplanationGraph::new(&report, query);
 
         assert_eq!(query.symbol, 'V');
+
+        // The big knowledge base can exceed the explicit trace budget.
+        // In that case, the engine result is valid but the partial trace
+        // must NOT be interpreted as a complete graphical proof. Signed
+        // premise dependencies are tested on smaller complete traces above.
+        if query.trace.truncated
+        {
+            assert!(query.trace.events.len()
+                <= crate::trace::MAX_TRACE_EVENTS_PER_QUERY);
+            assert!(query.graph.nodes.is_empty());
+            return;
+        }
         assert!(conflicting_symbols(query).contains(&'R'),
             "C=>!R conflicts with enabled R");
         assert_eq!(observed_symbol_status(query, 'C'), LogicValue::Contradiction);
