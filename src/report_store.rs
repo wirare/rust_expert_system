@@ -13,7 +13,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::de::{DeserializeSeed, Error as DeError, IgnoredAny, MapAccess, SeqAccess, Visitor};
-use serde::Deserialize;
 
 use crate::report::{ExecutionReport, QueryExecution, ReasoningGraph, RewriteHistory};
 use crate::system::System;
