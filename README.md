@@ -62,8 +62,12 @@ Given fact A  -->  Applied rule A => B  -->  Derived B  -->  Query B = TRUE
 - Nodes **cannot be dragged, repositioned, or edited**. The graph can be
   panned with scrollbars and zoomed between 70% and 145%.
 - A contradictory result has **separate positive and negative proof paths**.
-  If the engine falls back to False without a negative proof, an explanatory
-  notice explicitly states that default False is not a proven negation.
+  Conflicting evidence encountered during a query (for example enabled R
+  together with C=>!R) is also listed as a diagnostic warning. The graph
+  follows only supporting polarity for each applied premise, so !R cannot
+  falsely appear as evidence for R|T. If the engine falls back to False
+  without a negative proof, an explanatory notice explicitly states that
+  default False is not a proven negation.
   Unresolved OR constraints are linked with a **dashed, non-proof** arrow.
 - The canvas is an explanation extracted from causal trace dependencies.
   Exploratory, unsuccessful search attempts are intentionally omitted from
