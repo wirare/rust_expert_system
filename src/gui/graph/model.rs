@@ -314,36 +314,24 @@ impl Builder<'_>
                     literal: Some(literal),
                 });
 
-                let ancestors = causes.iter().flat_map(|cause| self.resolve(*cause))
-                    .collect::<Vec<_>>();
                 if forced_by_clause
                 {
-                    // Other proven literals eliminate alternative choices.
-                    // Show their support entering the clause rather than
-                    // drawing a misleading proof directly into the forced fact.
-                    let clause = ancestors.iter().find(|id| self.output.node(**id)
-                        .is_some_and(|node| node.kind == NodeKind::Clause)).copied();
-                    if let Some(clause) = clause
+                    // Do not classify every causal predecessor as a refutation.
+                    // In particular, RuleApplied and ConstraintActivated are
+                    // evidence of *activation*, not proof that an alternative
+                    // is false. This previously created edges from A=>(E|K)
+                    // to an unrelated !K|L clause.
+                    if let ProofOrigin::UnitPropagation { constraint_id } = origin
                     {
-                        self.link(clause, event_id, LinkKind::Forces);
-                        for predecessor in ancestors
-                        {
-                            if predecessor != clause
-                            {
-                                self.link(predecessor, clause, LinkKind::RulesOut);
-                            }
-                        }
-                    }
-                    else
-                    {
-                        for predecessor in ancestors
-                        {
-                            self.link(predecessor, event_id, LinkKind::Supports);
-                        }
+                        self.resolve_forced_clause(
+                            event_id, literal, constraint_id, &causes
+                        );
                     }
                 }
                 else
                 {
+                    let ancestors = causes.iter().flat_map(|cause| self.resolve(*cause))
+                        .collect::<Vec<_>>();
                     for predecessor in ancestors
                     {
                         self.link(predecessor, event_id, LinkKind::Derives);
@@ -413,6 +401,146 @@ impl Builder<'_>
                 sources.sort_unstable();
                 sources.dedup();
                 sources
+            }
+        }
+    }
+
+    /// Rebuild one unit-propagation step from *typed* evidence.
+    ///
+    /// The activation is matched to the constraint ID that actually forced
+    /// the literal; a refutation must be an explicit proof of the opposite
+    /// polarity of another literal *in that same clause*.
+    fn resolve_forced_clause(
+        &mut self,
+        proof_event: EventId,
+        forced: Literal,
+        constraint_id: usize,
+        causes: &[EventId],
+    )
+    {
+        let events = &self.query.trace.events;
+        let mut activation = None;
+        let mut clause_literals = None;
+
+        for &cause in causes
+        {
+            let Some(event) = events.get(cause as usize) else
+            {
+                continue;
+            };
+
+            let activation_id = match &event.kind
+            {
+                TraceEventKind::ConstraintActivated {
+                    constraint_id: index, ..
+                } if *index == constraint_id => Some(event.id),
+
+                TraceEventKind::ConstraintEvaluated {
+                    constraint_id: index, ..
+                } if *index == constraint_id => event.causes.iter().copied()
+                    .find(|&id| matches!(
+                        events.get(id as usize).map(|e| &e.kind),
+                        Some(TraceEventKind::ConstraintActivated {
+                            constraint_id: activated, ..
+                        }) if *activated == constraint_id
+                    )),
+
+                _ => None,
+            };
+
+            if let Some(id) = activation_id
+            {
+                if let Some(event) = events.get(id as usize)
+                {
+                    if let TraceEventKind::ConstraintActivated {
+                        literals, ..
+                    } = &event.kind
+                    {
+                        if literals.contains(&forced)
+                        {
+                            activation = Some(id);
+                            clause_literals = Some(literals.clone());
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        let clause_node = activation.and_then(|id|
+        {
+            self.resolve(id).into_iter().find(|candidate|
+            {
+                self.output.node(*candidate).is_some_and(|node|
+                {
+                    node.kind == NodeKind::Clause && node.event_id == Some(id)
+                })
+            })
+        });
+
+        // If the trace does not contain a matching activation, do not
+        // invent a causal relationship to another clause.
+        let Some(clause_node) = clause_node else
+        {
+            return;
+        };
+
+        self.link(clause_node, proof_event, LinkKind::Forces);
+        let Some(literals) = clause_literals else
+        {
+            return;
+        };
+
+        for &cause in causes
+        {
+            let Some(event) = self.query.trace.events.get(cause as usize) else
+            {
+                continue;
+            };
+
+            let evidence_id = match &event.kind
+            {
+                TraceEventKind::LiteralProven { .. } => Some(cause),
+                TraceEventKind::ProofReused { original_event, .. } =>
+                    Some(*original_event),
+                _ => None,
+            };
+
+            let Some(evidence_id) = evidence_id else
+            {
+                continue;
+            };
+
+            let Some(evidence) = self.query.trace.events.get(evidence_id as usize) else
+            {
+                continue;
+            };
+
+            let TraceEventKind::LiteralProven {
+                literal: established, ..
+            } = &evidence.kind else
+            {
+                continue;
+            };
+
+            // Prove the *opposite* of another literal in this exact clause.
+            // A rule or a different clause cannot constitute a refutation.
+            if established.symbol == forced.symbol || !literals.iter().any(|candidate|
+                candidate.symbol == established.symbol
+                    && candidate.positive != established.positive)
+            {
+                continue;
+            }
+
+            let sources = self.resolve(evidence_id);
+            for source in sources
+            {
+                if self.output.node(source).is_some_and(|node|
+                    node.literal == Some(*established)
+                        && matches!(node.kind, NodeKind::Fact | NodeKind::Derived))
+                {
+                    self.link(source, clause_node, LinkKind::RulesOut);
+                }
             }
         }
     }
@@ -594,6 +722,83 @@ mod tests
         assert!(graph.nodes.iter().any(|node| node.kind == NodeKind::Clause));
         assert!(graph.links.iter().any(|edge| edge.kind == LinkKind::Forces));
         assert!(graph.links.iter().any(|edge| edge.kind == LinkKind::RulesOut));
+    }
+
+    #[test]
+    fn rules_out_edges_only_come_from_explicit_literal_refutations()
+    {
+        // Exercises the exact overlapping E|K and !K|L clause pattern
+        // from the large expert-system input.
+        let run = run_source(include_str!("../../../big_test.txt"), SolveMode::Sequential).unwrap();
+        let query = &run.execution.queries[0];
+        let graph = ExplanationGraph::new(&run.execution, query);
+        for link in graph.links.iter().filter(|edge| edge.kind == LinkKind::RulesOut)
+        {
+            let from = graph.node(link.from).unwrap();
+            let to = graph.node(link.to).unwrap();
+            assert!(
+                matches!(from.kind, NodeKind::Fact | NodeKind::Derived),
+                "Only a proven literal may rule out an alternative: {:?} -> {:?}",
+                from, to
+            );
+            assert_eq!(to.kind, NodeKind::Clause);
+            let established = from.literal.expect("explicit proof");
+            let clause = to.event_id.expect("constraint activation");
+            // The exact underlying clause must contain the opposite
+            // polarity to the established literal.
+            let TraceEventKind::ConstraintActivated { literals, .. } =
+                &query.trace.events[clause as usize].kind else
+            {
+                panic!("Refuted clause does not point at an activation event");
+            };
+            assert!(literals.iter().any(|candidate|
+                candidate.symbol == established.symbol
+                    && candidate.positive != established.positive
+            ));
+        }
+    }
+
+    #[test]
+    fn an_applied_rule_only_activates_its_own_constraint()
+    {
+        let run = run_source(include_str!("../../../big_test.txt"), SolveMode::Sequential).unwrap();
+        let query = &run.execution.queries[4]; // E
+        let graph = ExplanationGraph::new(&run.execution, query);
+
+        for link in graph.links.iter().filter(|edge| edge.kind == LinkKind::Activates)
+        {
+            let source = graph.node(link.from).unwrap();
+            let target = graph.node(link.to).unwrap();
+
+            let (Some(rule_event), Some(constraint_event)) =
+                (source.event_id, target.event_id) else
+            {
+                panic!("Activation edge missing causal event IDs");
+            };
+            let TraceEventKind::RuleApplied { rule_id: source_rule } =
+                &query.trace.events[rule_event as usize].kind else
+            {
+                panic!("Activation source must be an applied rule");
+            };
+            let TraceEventKind::ConstraintActivated { rule_id: target_rule, .. } =
+                &query.trace.events[constraint_event as usize].kind else
+            {
+                panic!("Activation target must be a real OR clause");
+            };
+            assert_eq!(
+                source_rule, target_rule,
+                "Rule #{source_rule} must not activate rule #{target_rule}'s clause"
+            );
+        }
+        assert!(graph.links.iter().all(|edge|
+        {
+            if edge.kind == LinkKind::RulesOut
+            {
+                graph.node(edge.from).is_some_and(|node|
+                    matches!(node.kind, NodeKind::Fact | NodeKind::Derived))
+            }
+            else { true }
+        }));
     }
 
     #[test]
