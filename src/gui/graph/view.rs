@@ -14,7 +14,7 @@ use super::layout::{GraphLayout, NODE_HEIGHT, NODE_WIDTH};
 use super::routing::{self, EntryPort, RoutedEdge};
 use super::model::{
     DisplayNodeId, ExplanationGraph, ExplanationLink, LinkKind, NodeKind,
-    outcome_name,
+    outcome_name, conflicting_symbols,
 };
 
 struct CachedDiagram
@@ -519,6 +519,19 @@ impl GraphViewer
             cache.graph.links.len(),
             query.trace.events.len(),
         ));
+
+        let conflicts = conflicting_symbols(query);
+        if !conflicts.is_empty()
+        {
+            ui.colored_label(
+                egui::Color32::from_rgb(239, 172, 91),
+                format!(
+                    "Conflicting facts encountered: {} (both positive and negative evidence). \
+These are diagnostic conflicts, not automatically prerequisites of this proof.",
+                    conflicts.iter().map(char::to_string).collect::<Vec<_>>().join(", "),
+                ),
+            );
+        }
 
         if cache.graph.limited
         {
