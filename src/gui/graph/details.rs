@@ -126,7 +126,10 @@ fn node_details(
 
             if let Some(event_id) = node.event_id
             {
-                let premise = query.trace.events.iter().find(|event|
+                // Multiple attempts may evaluate the same normalized rule.
+                // Inspect the premise immediately preceding *this* application,
+                // not the first evaluation recorded for the rule.
+                let premise = query.trace.events.iter().rev().find(|event|
                 {
                     matches!(&event.kind, TraceEventKind::PremiseEvaluated {
                         rule_id: index, ..
