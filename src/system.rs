@@ -74,13 +74,54 @@ enum ConstraintState
     Contradiction,
 }
 
-#[derive(PartialEq, Eq)]
+#[derive(PartialEq, Eq, Clone, Copy)]
 enum Operation
 {
     And,
     Or,
     Not,
     Xor,
+}
+
+/// Signed causal evidence for the most recently evaluated expression.
+///
+/// Truth and falsity must remain separate: a contradictory literal can have
+/// valid positive support without its negative proof justifying the same rule.
+/// Empty vectors are also valid (e.g. negation-as-failure / default false).
+#[derive(Debug, Default, Clone)]
+struct ExpressionEvidence
+{
+    positive: Vec<EventId>,
+    negative: Vec<EventId>,
+}
+
+impl ExpressionEvidence
+{
+    fn combine(a: &[EventId], b: &[EventId]) -> Vec<EventId>
+    {
+        let mut result = a.to_vec();
+        result.extend_from_slice(b);
+        result.sort_unstable();
+        result.dedup();
+        result
+    }
+
+    fn observed(&self) -> Vec<EventId>
+    {
+        Self::combine(&self.positive, &self.negative)
+    }
+
+    /// This is a witness for applying a rule, even when the result also has
+    /// negative support. Conflicting evidence is preserved in 'observed'.
+    fn premise_support(&self, state: FactState) -> Vec<EventId>
+    {
+        match state
+        {
+            FactState::True | FactState::Contradiction => self.positive.clone(),
+            FactState::False => self.negative.clone(),
+            FactState::Undetermined => Vec::new(),
+        }
+    }
 }
 
 impl ProofState
@@ -426,64 +467,122 @@ impl<'a> System<'a>
         Self::mark_proven(ctx, symbol, state, ProofOrigin::UnitPropagation { constraint_id }, causes)
     }
 
+    /// Belnap-style signed support: True supports truth, False supports
+    /// falsity, Contradiction supports both, Undetermined supports neither.
+    fn state_bits(state: FactState) -> (bool, bool)
+    {
+        match state
+        {
+            FactState::True => (true, false),
+            FactState::False => (false, true),
+            FactState::Contradiction => (true, true),
+            FactState::Undetermined => (false, false),
+        }
+    }
+
+    fn from_bits(positive: bool, negative: bool) -> FactState
+    {
+        match (positive, negative)
+        {
+            (true, true) => FactState::Contradiction,
+            (true, false) => FactState::True,
+            (false, true) => FactState::False,
+            (false, false) => FactState::Undetermined,
+        }
+    }
+
+    /// Apply operators to truth/falsity support separately, rather than
+    /// propagating Contradiction unconditionally from any subexpression.
     fn do_operation(op: Operation, lhs: FactState, rhs: Option<FactState>) -> FactState
     {
-        if lhs == FactState::Contradiction
-        {
-            return FactState::Contradiction;
-        }
+        let (lp, ln) = Self::state_bits(lhs);
+        let (rp, rn) = rhs.map(Self::state_bits).unwrap_or((false, false));
 
-        if rhs == Some(FactState::Contradiction)
+        let (positive, negative) = match op
         {
-            return FactState::Contradiction;
-        }
+            Operation::Not => (ln, lp),
+            Operation::And => (lp && rp, ln || rn),
+            Operation::Or => (lp || rp, ln && rn),
+            Operation::Xor =>
+            {
+                ((lp && rn) || (ln && rp), (lp && rp) || (ln && rn))
+            }
+        };
+
+        Self::from_bits(positive, negative)
+    }
+
+    /// Construct a *witness* for each truth polarity. For OR only one true
+    /// operand is necessary; for AND all true operands are necessary. A rule
+    /// premise never depends on evidence supporting its opposite polarity.
+    fn operation_evidence(
+        op: Operation,
+        lhs: FactState,
+        left: ExpressionEvidence,
+        rhs: Option<(FactState, ExpressionEvidence)>,
+    ) -> ExpressionEvidence
+    {
+        let (lp, ln) = Self::state_bits(lhs);
+        let (rp, rn) = rhs.as_ref()
+            .map(|(state, _)| Self::state_bits(*state))
+            .unwrap_or((false, false));
+        let right = rhs.map(|(_, evidence)| evidence).unwrap_or_default();
 
         match op
         {
-            Operation::Not =>
-            {
-                match lhs
-                {
-                    FactState::True             => FactState::False,
-                    FactState::False            => FactState::True,
-                    FactState::Undetermined     => FactState::Undetermined,
-                    FactState::Contradiction    => unreachable!(),
-                }
-            }
+            Operation::Not => ExpressionEvidence {
+                positive: left.negative,
+                negative: left.positive,
+            },
 
-            Operation::And =>
-            {
-                let rhs = rhs.expect("Binary operation requires rhs");
-                match (lhs, rhs)
+            Operation::And => ExpressionEvidence {
+                positive: if lp && rp
                 {
-                    (FactState::False, _) | (_, FactState::False)   => FactState::False,
-                    (FactState::True, FactState::True)              => FactState::True,
-                    _                                               => FactState::Undetermined,
+                    ExpressionEvidence::combine(&left.positive, &right.positive)
                 }
-            }
+                else { Vec::new() },
+                negative: if ln
+                {
+                    left.negative
+                }
+                else if rn { right.negative }
+                else { Vec::new() },
+            },
 
-            Operation::Or =>
-            {
-                let rhs = rhs.expect("Binary operation requires rhs");
-                match (lhs, rhs)
+            Operation::Or => ExpressionEvidence {
+                positive: if lp
                 {
-                    (FactState::True, _) | (_, FactState::True) => FactState::True,
-                    (FactState::False, FactState::False)        => FactState::False,
-                    _                                           => FactState::Undetermined,
+                    left.positive
                 }
-            }
+                else if rp { right.positive }
+                else { Vec::new() },
+                negative: if ln && rn
+                {
+                    ExpressionEvidence::combine(&left.negative, &right.negative)
+                }
+                else { Vec::new() },
+            },
 
-            Operation::Xor =>
-            {
-                let rhs = rhs.expect("Binary operation requires rhs");
-                match (lhs, rhs)
+            Operation::Xor => ExpressionEvidence {
+                positive: if lp && rn
                 {
-                    (FactState::Undetermined, _)        | (_, FactState::Undetermined)          => FactState::Undetermined,
-                    (FactState::True, FactState::False) | (FactState::False, FactState::True)   => FactState::True,
-                    (FactState::True, FactState::True)  | (FactState::False, FactState::False)  => FactState::False,
-                    _                                                                           => unreachable!(),
+                    ExpressionEvidence::combine(&left.positive, &right.negative)
                 }
-            }
+                else if ln && rp
+                {
+                    ExpressionEvidence::combine(&left.negative, &right.positive)
+                }
+                else { Vec::new() },
+                negative: if lp && rp
+                {
+                    ExpressionEvidence::combine(&left.positive, &right.positive)
+                }
+                else if ln && rn
+                {
+                    ExpressionEvidence::combine(&left.negative, &right.negative)
+                }
+                else { Vec::new() },
+            },
         }
     }
 
@@ -569,48 +668,71 @@ impl<'a> System<'a>
             })
     }
 
-    fn evaluate_expression_from_ast(&self, eval_ctx: &mut EvaluationCtx, exp: &ASTNode) -> Result<FactState, String>
+    fn evaluate_expression_from_ast(
+        &self,
+        eval_ctx: &mut EvaluationCtx,
+        exp: &ASTNode,
+    ) -> Result<FactState, String>
     {
-        let mut causes = Vec::new();
-        let result = if exp.token.is_operator()
+        self.evaluate_expression_with_evidence(eval_ctx, exp).map(|(state, _)| state)
+    }
+
+    fn evaluate_expression_with_evidence(
+        &self,
+        eval_ctx: &mut EvaluationCtx,
+        exp: &ASTNode,
+    ) -> Result<(FactState, ExpressionEvidence), String>
+    {
+        let (result, evidence) = if exp.token.is_operator()
         {
-            let lhs = self.evaluate_expression_from_ast(eval_ctx, exp.left.as_deref().unwrap())?;
-            causes.extend(eval_ctx.last_evidence.iter().copied());
-            let rhs = if exp.token.token_type != TokenType::Not
+            let (lhs, lhs_evidence) = self.evaluate_expression_with_evidence(
+                eval_ctx, exp.left.as_deref().unwrap(),
+            )?;
+            let op: Operation = exp.token.token_type.into();
+
+            let rhs = if op != Operation::Not
             {
-                let rhs = self.evaluate_expression_from_ast(eval_ctx, exp.right.as_deref().unwrap())?;
-                causes.extend(eval_ctx.last_evidence.iter().copied());
-                Some(rhs)
+                Some(self.evaluate_expression_with_evidence(
+                    eval_ctx, exp.right.as_deref().unwrap(),
+                )?)
             }
             else { None };
-            System::do_operation(exp.token.token_type.into(), lhs, rhs)
+
+            let result = Self::do_operation(op, lhs, rhs.as_ref().map(|(s, _)| *s));
+            let evidence = Self::operation_evidence(op, lhs, lhs_evidence, rhs);
+            (result, evidence)
         }
         else
         {
             let symbol = exp.token.value.chars().next().unwrap();
             let state = self.evaluate_symbol(eval_ctx, symbol)?;
-            let index = symbol_to_nb(symbol) * 2;
-            if eval_ctx.symbols_state[symbol_to_nb(symbol)].positive
-            {
-                causes.extend(eval_ctx.proof_events[index]);
-            }
-            if eval_ctx.symbols_state[symbol_to_nb(symbol)].negative
-            {
-                causes.extend(eval_ctx.proof_events[index + 1]);
-            }
-            state
+            let base = symbol_to_nb(symbol) * 2;
+            let evidence = ExpressionEvidence {
+                positive: eval_ctx.proof_events[base].into_iter().collect(),
+                negative: eval_ctx.proof_events[base + 1].into_iter().collect(),
+            };
+            (state, evidence)
         };
-        causes.sort_unstable();
-        causes.dedup();
+
         if eval_ctx.trace.is_some()
         {
-            let expression = crate::ast::format_ast(exp);
-            let event = Self::emit(eval_ctx, TraceEventKind::ExpressionEvaluated {
-                expression, result: result.into(), operand_events: causes.clone(),
-            }, causes);
+            let observed = evidence.observed();
+            // The event retains both signs for inspection, but only evidence
+            // supporting the evaluated polarity is followed by proof graphs.
+            let supporting = evidence.premise_support(result);
+            let event = Self::emit(
+                eval_ctx,
+                TraceEventKind::ExpressionEvaluated {
+                    expression: crate::ast::format_ast(exp),
+                    result: result.into(),
+                    operand_events: observed,
+                },
+                supporting,
+            );
             eval_ctx.last_evidence = event.into_iter().collect();
         }
-        Ok(result)
+
+        Ok((result, evidence))
     }
 
     fn evaluate_expression_from_idx(&self, eval_ctx: &mut EvaluationCtx, rule_idx: usize) -> Result<FactState, String>
