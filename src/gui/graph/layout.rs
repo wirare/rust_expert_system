@@ -1,8 +1,7 @@
-//! Deterministic, read-only layered layout built with petgraph.
+//! Stable, dependency-oriented layout for the *focused* proof explanation.
 //!
-//! The model is intentionally independent from egui. Only causal edge types
-//! participate in ranking. Navigation/search/return links are still drawn,
-//! but do not collapse the whole graph into a single cyclic component.
+//! petgraph condenses recursion safely, then lays the remaining dependency
+//! graph out from supporting facts (left) toward the requested answer (right).
 
 use std::collections::{BTreeSet, HashMap};
 
@@ -10,202 +9,208 @@ use petgraph::algo::kosaraju_scc;
 use petgraph::graph::{DiGraph, NodeIndex};
 use petgraph::visit::EdgeRef;
 
-use crate::report::{EdgeKind, GraphNode, GraphNodeKind, NodeId, ReasoningGraph};
+use super::model::{DisplayNodeId, ExplanationGraph, NodeKind};
 
-pub const NODE_WIDTH: f32 = 182.0;
-pub const NODE_HEIGHT: f32 = 62.0;
-pub const COLUMN_GAP: f32 = 106.0;
-pub const ROW_GAP: f32 = 26.0;
-const MARGIN: f32 = 45.0;
+pub const NODE_WIDTH: f32 = 282.0;
+pub const NODE_HEIGHT: f32 = 112.0;
+pub const COLUMN_GAP: f32 = 110.0;
+pub const ROW_GAP: f32 = 34.0;
+const PADDING: f32 = 52.0;
 
-#[derive(Debug, Clone, Copy)]
-pub struct PlacedNode
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Placement
 {
-    pub id: NodeId,
+    pub id: DisplayNodeId,
     pub x: f32,
     pub y: f32,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct GraphLayout
 {
-    pub nodes: Vec<PlacedNode>,
+    pub nodes: Vec<Placement>,
     pub width: f32,
     pub height: f32,
 }
 
-fn is_layout_dependency(kind: EdgeKind) -> bool
-{
-    matches!(
-        kind,
-        EdgeKind::Justification
-            | EdgeKind::PremiseDependency
-            | EdgeKind::ConstraintActivation
-            | EdgeKind::UnitPropagation
-    )
-}
-
-fn node_priority(node: &GraphNode) -> u8
-{
-    match node.kind
-    {
-        GraphNodeKind::InitialFact { .. } => 0,
-        GraphNodeKind::SearchGoal { .. } => 1,
-        GraphNodeKind::Rule { .. } => 2,
-        GraphNodeKind::Constraint { .. } => 3,
-        GraphNodeKind::Deduction { .. } => 4,
-        GraphNodeKind::Query { .. } => 5,
-        _ => 6,
-    }
-}
-
 impl GraphLayout
 {
-    pub fn new(source: &ReasoningGraph) -> Self
+    pub fn new(explanation: &ExplanationGraph) -> Self
     {
-        if source.nodes.is_empty()
+        if explanation.nodes.is_empty()
         {
-            return Self {
-                nodes: Vec::new(),
-                width: 0.0,
-                height: 0.0,
-            };
+            return Self::default();
         }
 
-        let mut graph = DiGraph::<NodeId, ()>::new();
-        let mut indices: HashMap<NodeId, NodeIndex> = HashMap::new();
-
-        for node in &source.nodes
+        let mut graph = DiGraph::<DisplayNodeId, ()>::new();
+        let mut indices = HashMap::<DisplayNodeId, NodeIndex>::new();
+        for node in &explanation.nodes
         {
             indices.insert(node.id, graph.add_node(node.id));
         }
-
-        for edge in &source.edges
+        for link in &explanation.links
         {
-            if !is_layout_dependency(edge.kind)
+            if let (Some(&a), Some(&b)) =
+                (indices.get(&link.from), indices.get(&link.to))
             {
-                continue;
-            }
-            if let (Some(&start), Some(&end)) =
-                (indices.get(&edge.from), indices.get(&edge.to))
-            {
-                if start != end
+                if a != b
                 {
-                    graph.add_edge(start, end, ());
+                    graph.add_edge(a, b, ());
                 }
             }
         }
 
-        // Condense strongly connected components. A recursive rule system
-        // can be cyclic, so a plain topological sort is not sufficient.
+        // Robust to accidental cycles, even if a malformed or partially
+        // captured trace contains circular dependencies.
         let components = kosaraju_scc(&graph);
-        let mut component_of = vec![0_usize; graph.node_count()];
-
+        let mut owner = vec![0_usize; graph.node_count()];
         for (component, members) in components.iter().enumerate()
         {
-            for &node in members
+            for member in members
             {
-                component_of[node.index()] = component;
+                owner[member.index()] = component;
             }
         }
 
-        let mut children = vec![BTreeSet::new(); components.len()];
+        let mut successors = vec![BTreeSet::new(); components.len()];
         let mut indegree = vec![0_usize; components.len()];
-
         for edge in graph.edge_references()
         {
-            let source = component_of[edge.source().index()];
-            let target = component_of[edge.target().index()];
-            if source != target && children[source].insert(target)
+            let source = owner[edge.source().index()];
+            let target = owner[edge.target().index()];
+            if source != target && successors[source].insert(target)
             {
                 indegree[target] += 1;
             }
         }
 
-        let mut ready: BTreeSet<usize> = indegree.iter().enumerate()
-            .filter_map(|(index, &degree)| (degree == 0).then_some(index))
-            .collect();
+        let mut queue = indegree.iter().enumerate()
+            .filter_map(|(i, degree)| (*degree == 0).then_some(i))
+            .collect::<BTreeSet<usize>>();
+        let mut ranks = vec![0_usize; components.len()];
 
-        let mut layer_of_component = vec![0_usize; components.len()];
-
-        while let Some(&current) = ready.iter().next()
+        while let Some(&component) = queue.iter().next()
         {
-            ready.remove(&current);
-            for &child in &children[current]
+            queue.remove(&component);
+            for &next in &successors[component]
             {
-                layer_of_component[child] = layer_of_component[child]
-                    .max(layer_of_component[current] + 1);
-                indegree[child] -= 1;
-                if indegree[child] == 0
+                ranks[next] = ranks[next].max(ranks[component] + 1);
+                indegree[next] -= 1;
+                if indegree[next] == 0
                 {
-                    ready.insert(child);
+                    queue.insert(next);
                 }
             }
         }
 
-        let mut layers = vec![0_usize; source.nodes.len()];
-        for (index, node) in source.nodes.iter().enumerate()
+        let mut layer_of = HashMap::<DisplayNodeId, usize>::new();
+        for node in &explanation.nodes
         {
-            let node_index = indices[&node.id];
-            layers[index] = layer_of_component[component_of[node_index.index()]];
+            layer_of.insert(node.id, ranks[owner[indices[&node.id].index()]]);
         }
 
-        // The query is the rightmost sink, even when it is unresolved and
-        // consequently has no established proof events to connect to it.
-        let maximum = layers.iter().copied().max().unwrap_or(0);
-        for (index, node) in source.nodes.iter().enumerate()
+        let max_layer = layer_of.values().copied().max().unwrap_or(0);
+        // The answer is always a terminal node in the visible explanation.
+        layer_of.insert(explanation.root, max_layer);
+
+        let total_columns = layer_of.values().copied().max().unwrap_or(0) + 1;
+        let mut columns = vec![Vec::<DisplayNodeId>::new(); total_columns];
+        for node in &explanation.nodes
         {
-            if matches!(node.kind, GraphNodeKind::Query { .. })
+            columns[layer_of[&node.id]].push(node.id);
+        }
+
+        let mut order = HashMap::<DisplayNodeId, usize>::new();
+        for layer in &mut columns
+        {
+            layer.sort_unstable();
+        }
+
+        // Barycentric sweep: keep facts feeding the same rule or clause near
+        // one another, reducing crossing compared with alphabetic sorting.
+        for (depth, layer) in columns.iter_mut().enumerate()
+        {
+            let scores = layer.iter().map(|&id|
             {
-                layers[index] = maximum + 1;
+                let predecessors = explanation.links.iter()
+                    .filter(|link| link.to == id && layer_of[&link.from] < depth)
+                    .filter_map(|link| order.get(&link.from).copied())
+                    .collect::<Vec<_>>();
+                let mean = if predecessors.is_empty()
+                {
+                    f32::MAX
+                }
+                else
+                {
+                    predecessors.iter().map(|x| *x as f32).sum::<f32>()
+                        / predecessors.len() as f32
+                };
+                (id, mean)
+            }).collect::<HashMap<_, _>>();
+
+            layer.sort_by(|left, right|
+            {
+                scores[left].total_cmp(&scores[right])
+                    .then_with(||
+                    {
+                        let left_kind = explanation.node(*left).map(|n| n.kind);
+                        let right_kind = explanation.node(*right).map(|n| n.kind);
+                        fn priority(kind: Option<NodeKind>) -> u8
+                        {
+                            match kind
+                            {
+                                Some(NodeKind::Fact) => 0,
+                                Some(NodeKind::Rule) => 1,
+                                Some(NodeKind::Clause) => 2,
+                                Some(NodeKind::Derived) => 3,
+                                Some(NodeKind::Notice) => 4,
+                                Some(NodeKind::Answer) => 5,
+                                None => 6,
+                            }
+                        }
+                        priority(left_kind).cmp(&priority(right_kind))
+                    })
+                    .then_with(|| left.cmp(right))
+            });
+
+            for (row, &id) in layer.iter().enumerate()
+            {
+                order.insert(id, row);
             }
         }
 
-        let column_count = layers.iter().copied().max().unwrap_or(0) + 1;
-        let mut columns = vec![Vec::<usize>::new(); column_count];
-        for (index, &column) in layers.iter().enumerate()
+        let rows = columns.iter().map(Vec::len).max().unwrap_or(1);
+        let total_height = PADDING * 2.0
+            + rows as f32 * NODE_HEIGHT
+            + rows.saturating_sub(1) as f32 * ROW_GAP;
+
+        let mut positions = Vec::with_capacity(explanation.nodes.len());
+        for (column, layer) in columns.iter().enumerate()
         {
-            columns[column].push(index);
-        }
+            let column_height = layer.len() as f32 * NODE_HEIGHT
+                + layer.len().saturating_sub(1) as f32 * ROW_GAP;
+            let offset = ((total_height - column_height) * 0.5).max(PADDING * 0.5);
 
-        let mut placed = Vec::with_capacity(source.nodes.len());
-        let mut maximum_rows = 0_usize;
-
-        for (column, members) in columns.iter_mut().enumerate()
-        {
-            // Sort independent vertices predictably. The stored proof/event
-            // IDs are stable, so layout does not change between UI frames.
-            members.sort_by(|&a, &b|
+            for (row, &id) in layer.iter().enumerate()
             {
-                node_priority(&source.nodes[a])
-                    .cmp(&node_priority(&source.nodes[b]))
-                    .then_with(|| source.nodes[a].label.cmp(&source.nodes[b].label))
-                    .then_with(|| source.nodes[a].id.cmp(&source.nodes[b].id))
-            });
-
-            maximum_rows = maximum_rows.max(members.len());
-            for (row, &index) in members.iter().enumerate()
-            {
-                placed.push(PlacedNode {
-                    id: source.nodes[index].id,
-                    x: MARGIN + column as f32 * (NODE_WIDTH + COLUMN_GAP),
-                    y: MARGIN + row as f32 * (NODE_HEIGHT + ROW_GAP),
+                positions.push(Placement {
+                    id,
+                    x: PADDING + column as f32 * (NODE_WIDTH + COLUMN_GAP),
+                    y: offset + row as f32 * (NODE_HEIGHT + ROW_GAP),
                 });
             }
         }
 
-        let width = MARGIN * 2.0
-            + column_count as f32 * NODE_WIDTH
-            + column_count.saturating_sub(1) as f32 * COLUMN_GAP;
-
-        let height = MARGIN * 2.0
-            + maximum_rows as f32 * NODE_HEIGHT
-            + maximum_rows.saturating_sub(1) as f32 * ROW_GAP;
-
-        Self { nodes: placed, width, height }
+        Self {
+            nodes: positions,
+            width: PADDING * 2.0
+                + total_columns as f32 * NODE_WIDTH
+                + total_columns.saturating_sub(1) as f32 * COLUMN_GAP,
+            height: total_height,
+        }
     }
 
-    pub fn location(&self, id: NodeId) -> Option<&PlacedNode>
+    pub fn location(&self, id: DisplayNodeId) -> Option<&Placement>
     {
         self.nodes.iter().find(|node| node.id == id)
     }
@@ -215,71 +220,46 @@ impl GraphLayout
 mod tests
 {
     use super::*;
-    use crate::report::{GraphEdge, GraphNode, QueryOutcome};
-    use crate::trace::LogicValue;
+    use crate::engine::{run_source, SolveMode};
+    use super::super::model::ExplanationGraph;
 
-    fn make_node(id: u64, kind: GraphNodeKind, label: &str) -> GraphNode
+    #[test]
+    fn dependencies_flow_left_to_right()
     {
-        GraphNode {
-            id,
-            kind,
-            label: label.to_owned(),
-            related_events: vec![],
+        let run = run_source("A=>B\n=A\n?B", SolveMode::Sequential).unwrap();
+        let explanation = ExplanationGraph::new(
+            &run.execution, &run.execution.queries[0],
+        );
+        let layout = GraphLayout::new(&explanation);
+        assert_eq!(layout.nodes.len(), explanation.nodes.len());
+
+        for link in &explanation.links
+        {
+            let left = layout.location(link.from).unwrap();
+            let right = layout.location(link.to).unwrap();
+            assert!(left.x <= right.x,
+                "Evidence must precede its conclusion: {:?} -> {:?}",
+                left, right);
         }
+
+        let again = GraphLayout::new(&explanation);
+        assert_eq!(layout.nodes, again.nodes);
     }
 
     #[test]
-    fn layout_is_stable_and_query_is_rightmost()
+    fn contradiction_has_two_paths_reaching_the_same_answer()
     {
-        let graph = ReasoningGraph {
-            nodes: vec![
-                make_node(11, GraphNodeKind::InitialFact { symbol:'A' }, "A"),
-                make_node(12, GraphNodeKind::Rule { rule_id:0 }, "Rule 0"),
-                make_node(13, GraphNodeKind::Deduction {
-                    literal: crate::trace::Literal { symbol:'B', positive:true },
-                    proof_event: 1
-                }, "B"),
-                make_node(14, GraphNodeKind::Query {
-                    symbol:'B',
-                    outcome:QueryOutcome::Value(LogicValue::True),
-                }, "Query B"),
-            ],
-            edges: vec![
-                GraphEdge { from:11,to:12,kind:EdgeKind::PremiseDependency,related_event:None },
-                GraphEdge { from:12,to:13,kind:EdgeKind::Justification,related_event:None },
-                GraphEdge { from:13,to:14,kind:EdgeKind::Justification,related_event:None },
-                GraphEdge { from:14,to:12,kind:EdgeKind::SearchDependency,related_event:None },
-            ],
-        };
+        let run = run_source(
+            "A=>B\nC=>!B\n=AC\n?B", SolveMode::Sequential,
+        ).unwrap();
+        let explanation = ExplanationGraph::new(
+            &run.execution, &run.execution.queries[0],
+        );
+        let layout = GraphLayout::new(&explanation);
+        let answer = layout.location(explanation.root).unwrap();
 
-        let layout = GraphLayout::new(&graph);
-        assert_eq!(layout.nodes.len(), 4);
-        assert!(layout.location(11).unwrap().x < layout.location(12).unwrap().x);
-        assert!(layout.location(12).unwrap().x < layout.location(13).unwrap().x);
-        assert!(layout.location(13).unwrap().x < layout.location(14).unwrap().x);
-
-        let next = GraphLayout::new(&graph);
-        assert_eq!(layout.location(13).unwrap().x, next.location(13).unwrap().x);
-        assert_eq!(layout.location(13).unwrap().y, next.location(13).unwrap().y);
-    }
-
-    #[test]
-    fn cyclic_graph_keeps_every_vertex()
-    {
-        let graph = ReasoningGraph {
-            nodes: vec![
-                make_node(0, GraphNodeKind::Rule {rule_id:0}, "R0"),
-                make_node(1, GraphNodeKind::Rule {rule_id:1}, "R1"),
-            ],
-            edges: vec![
-                GraphEdge {from:0,to:1,kind:EdgeKind::Justification,related_event:None},
-                GraphEdge {from:1,to:0,kind:EdgeKind::Justification,related_event:None},
-            ],
-        };
-
-        let layout = GraphLayout::new(&graph);
-        assert_eq!(layout.nodes.len(), 2);
-        assert_eq!(layout.location(0).unwrap().x, layout.location(1).unwrap().x);
-        assert_ne!(layout.location(0).unwrap().y, layout.location(1).unwrap().y);
+        assert!(explanation.links.iter().filter(|e| e.to == explanation.root)
+            .all(|e| layout.location(e.from).unwrap().x < answer.x));
+        assert!(layout.height >= NODE_HEIGHT);
     }
 }
