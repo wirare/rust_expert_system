@@ -54,6 +54,8 @@ pub struct ExplanationNode
     pub event_id: Option<EventId>,
     pub rule_id: Option<usize>,
     pub literal: Option<Literal>,
+    /// Signed support observed in this query, not global truth.
+    pub observed_status: Option<LogicValue>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -145,6 +147,7 @@ impl ExplanationGraph
             event_id: None,
             rule_id: None,
             literal: None,
+            observed_status: None,
         });
 
         let final_event = query.trace.events.iter().rev().find(|event|
@@ -193,6 +196,63 @@ pub fn literal_text(literal: Literal) -> String
     }
 }
 
+/// Remove a single outer grouping pair only when it encloses the whole
+/// rule, leaving all nested premise/conclusion parentheses intact.
+pub fn rule_display_expression(expression: &str) -> &str
+{
+    let expression = expression.trim();
+    if !expression.starts_with('(') || !expression.ends_with(')')
+    {
+        return expression;
+    }
+
+    let mut depth = 0_i32;
+    for (offset, ch) in expression.char_indices()
+    {
+        match ch
+        {
+            '(' => depth += 1,
+            ')' =>
+            {
+                depth -= 1;
+                if depth < 0 || (depth == 0 && offset + ch.len_utf8() < expression.len())
+                {
+                    return expression;
+                }
+            }
+            _ => {}
+        }
+    }
+    if depth == 0 { &expression[1..expression.len() - 1] }
+    else { expression }
+}
+
+/// States here are based on the proof events actually recorded for this query.
+/// In particular, False means !symbol was proved, not default false.
+pub fn observed_symbol_status(query: &QueryExecution, symbol: char) -> LogicValue
+{
+    let mut positive = false;
+    let mut negative = false;
+    for event in &query.trace.events
+    {
+        if let TraceEventKind::LiteralProven { literal, .. } = &event.kind
+        {
+            if literal.symbol == symbol
+            {
+                if literal.positive { positive = true; }
+                else { negative = true; }
+                if positive && negative { return LogicValue::Contradiction; }
+            }
+        }
+    }
+    match (positive, negative)
+    {
+        (true, false) => LogicValue::True,
+        (false, true) => LogicValue::False,
+        _ => LogicValue::Undetermined,
+    }
+}
+
 pub fn outcome_name(outcome: &QueryOutcome) -> &'static str
 {
     match outcome
@@ -209,26 +269,9 @@ pub fn outcome_name(outcome: &QueryOutcome) -> &'static str
 /// diagnostic warnings, not as causal proof edges for unrelated rules.
 pub fn conflicting_symbols(query: &QueryExecution) -> Vec<char>
 {
-    let mut polarities = [0_u8; 26];
-    for event in &query.trace.events
+    ('A'..='Z').filter(|symbol|
     {
-        if let TraceEventKind::LiteralProven { literal, .. } = &event.kind
-        {
-            if literal.symbol.is_ascii_uppercase()
-            {
-                let index = literal.symbol as usize - 'A' as usize;
-                polarities[index] |= if literal.positive { 1 } else { 2 };
-            }
-        }
-    }
-
-    polarities.iter().enumerate().filter_map(|(index, &flags)|
-    {
-        if flags == 3
-        {
-            Some((b'A' + index as u8) as char)
-        }
-        else { None }
+        observed_symbol_status(query, *symbol) == LogicValue::Contradiction
     }).collect()
 }
 
@@ -281,7 +324,7 @@ impl Builder<'_>
                 .find(|original| original.id == rule.original_rule_id)
                 .map(|original| format!("Input line {}", original.source_line))
                 .unwrap_or_else(|| "Normalized conclusion".into());
-            (rule.expression.clone(), line)
+            (rule_display_expression(&rule.expression).to_owned(), line)
         }
         else
         {
@@ -321,6 +364,7 @@ impl Builder<'_>
             TraceEventKind::LiteralProven { literal, origin } =>
             {
                 let forced_by_clause = matches!(&origin, ProofOrigin::UnitPropagation { .. });
+                let observed_status = observed_symbol_status(self.query, literal.symbol);
                 let (kind, subtitle, rule_id) = match &origin
                 {
                     ProofOrigin::InitialFact =>
@@ -331,6 +375,20 @@ impl Builder<'_>
                         (NodeKind::Derived, format!("Forced by OR constraint #{constraint_id}"), Some(*constraint_id)),
                 };
 
+                let subtitle = if observed_status == LogicValue::Contradiction
+                {
+                    format!(
+                        "Used as {} here; both {} and !{} are proven",
+                        if literal.positive { "TRUE" } else { "FALSE" },
+                        literal.symbol,
+                        literal.symbol,
+                    )
+                }
+                else
+                {
+                    subtitle
+                };
+
                 self.add_node(ExplanationNode {
                     id: event_id,
                     kind,
@@ -339,6 +397,7 @@ impl Builder<'_>
                     event_id: Some(event_id),
                     rule_id,
                     literal: Some(literal),
+                    observed_status: Some(observed_status),
                 });
 
                 if forced_by_clause
@@ -379,6 +438,7 @@ impl Builder<'_>
                     event_id: Some(event_id),
                     rule_id: Some(rule_id),
                     literal: None,
+                    observed_status: None,
                 });
 
                 let ancestors = causes.iter().flat_map(|cause| self.resolve(*cause))
@@ -402,6 +462,7 @@ impl Builder<'_>
                     event_id: Some(event_id),
                     rule_id: Some(constraint_id),
                     literal: None,
+                    observed_status: None,
                 });
 
                 let ancestors = causes.iter().flat_map(|cause| self.resolve(*cause))
@@ -683,6 +744,7 @@ impl Builder<'_>
             event_id: None,
             rule_id: None,
             literal: None,
+            observed_status: None,
         });
         self.link(NOTE_ID, QUERY_ID, kind);
     }
