@@ -726,6 +726,33 @@ mod tests
     }
 
     #[test]
+    fn contradictory_R_does_not_make_not_R_or_not_T_support_R_or_T()
+    {
+        let graph = explanation("C=>!R\nD=>!T\nR|T=>!C\n=CDR\n?C");
+
+        let rule = graph.nodes.iter().find(|node|
+            node.kind == NodeKind::Rule && node.title.contains("(R | T)")
+        ).expect("applied R|T rule");
+        let upstream = graph.links.iter().filter(|edge|
+            edge.to == rule.id && edge.kind == LinkKind::Premise
+        ).filter_map(|edge| graph.node(edge.from)).collect::<Vec<_>>();
+
+        assert!(upstream.iter().any(|node|
+            node.literal == Some(Literal { symbol: 'R', positive: true })),
+            "Positive R is sufficient to support the OR premise");
+        assert!(!upstream.iter().any(|node|
+            node.literal == Some(Literal { symbol: 'R', positive: false })
+            || node.literal == Some(Literal { symbol: 'T', positive: false })),
+            "Negative R/T evidence must not justify a positive OR premise");
+
+        let answer = graph.node(graph.root).unwrap();
+        assert!(answer.title.contains("CONTRADICTION"));
+        assert!(graph.nodes.iter().any(|node|
+            node.literal == Some(Literal { symbol: 'C', positive: false })),
+            "The rule must still be able to derive !C from positive R");
+    }
+
+    #[test]
     fn a_rule_activates_its_own_or_clause_and_not_another_clause()
     {
         // Minimal reproduction of the incorrectly rendered A => (E | K)
