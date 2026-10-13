@@ -151,6 +151,31 @@ mod tests
     use super::*;
 
     #[test]
+    fn big_test_without_c_keeps_query_result_and_bounds_trace_memory()
+    {
+        // C disabled is the reported problematic fact configuration.
+        // Keep this focused on V so CI checks both correctness and trace
+        // bounds without re-running 26 large traced searches.
+        let source = include_str!("../big_test.txt")
+            .replace("=ABCD", "=ABD")
+            .replace("?ABCDEFGHIJKLMNOPQRSTUVWXYZ", "?V");
+
+        let report = run_source(&source, SolveMode::Sequential).unwrap();
+        assert_eq!(report.results[0].symbol, 'V');
+        assert_eq!(report.results[0].value, Ok(LogicValue::False));
+        assert_eq!(report.execution.queries.len(), 1);
+
+        let trace = &report.execution.queries[0].trace;
+        assert!(trace.events.len() <= crate::trace::MAX_TRACE_EVENTS_PER_QUERY);
+
+        if trace.truncated
+        {
+            assert!(report.execution.queries[0].graph.nodes.is_empty(),
+                "An incomplete trace must not claim to be a complete proof");
+        }
+    }
+
+    #[test]
     fn captures_graphs_for_each_query_and_rewrite_rules()
     {
         let source = "A=>B\n=A\n?AB";
