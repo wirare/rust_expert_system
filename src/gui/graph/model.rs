@@ -5,7 +5,7 @@
 //! follows *only* causal evidence for the selected query, retaining the
 //! original event IDs so nothing is fabricated or disconnected from the engine.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 use crate::report::{ExecutionReport, QueryExecution, QueryOutcome};
 use crate::trace::{
