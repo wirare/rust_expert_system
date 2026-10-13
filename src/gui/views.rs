@@ -181,8 +181,8 @@ fn show_completed(ui: &mut egui::Ui, report: &RunReport)
     });
 
     ui.small(format!(
-        "Parse + index: {:?}   |   Inference: {:?}   |   Total: {:?}",
-        report.parse_duration, report.solve_duration, report.total_duration
+        "Parse + index: {:?}   |   Inference: {:?}   |   JSON streaming: {:?}   |   Total: {:?}",
+        report.parse_duration, report.solve_duration, report.report_duration, report.total_duration
     ));
 
     ui.add_space(10.0);
