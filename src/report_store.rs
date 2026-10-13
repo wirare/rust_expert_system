@@ -19,6 +19,33 @@ use crate::system::System;
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+fn disk_report_directory() -> Result<PathBuf, String>
+{
+    // /tmp can be a tmpfs mount: writing a large report there would merely
+    // transfer the memory problem into the filesystem's page cache. Prefer
+    // a per-user cache directory backed by the normal filesystem.
+    let base = std::env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .or_else(||
+        {
+            std::env::var_os("LOCALAPPDATA").map(PathBuf::from)
+        })
+        .or_else(||
+        {
+            std::env::var_os("HOME").map(|home|
+                PathBuf::from(home).join(".cache")
+            )
+        })
+        .unwrap_or_else(std::env::temp_dir);
+
+    let directory = base.join("rust-expert-system");
+    std::fs::create_dir_all(&directory).map_err(|error|
+        format!("Unable to create the report cache directory '{}': {error}",
+            directory.display())
+    )?;
+    Ok(directory)
+}
+
 #[derive(Debug)]
 pub struct ReportStore
 {
@@ -36,11 +63,12 @@ impl ReportStore
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
+        let directory = disk_report_directory()?;
 
         for _ in 0..20
         {
             let id = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-            let path = std::env::temp_dir().join(format!(
+            let path = directory.join(format!(
                 "expert-system-report-{}-{timestamp}-{id}.json",
                 std::process::id(),
             ));
