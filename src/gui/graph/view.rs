@@ -1,34 +1,35 @@
-//! Static egui canvas for reasoning graphs. Nodes support click/inspect,
-//! but have no drag, edit, or reposition interaction.
+//! Explanation-first, read-only proof canvas with a contained inspector.
+//!
+//! Unlike the old search graph, only final causal evidence is displayed.
+//! Nodes never have drag handlers. Zoom and scroll affect the viewport only.
 
 use std::collections::HashMap;
 
 use eframe::egui;
 
-use crate::report::{
-    EdgeKind, ExecutionReport, GraphNode, GraphNodeKind, NodeId, QueryExecution, QueryOutcome,
-    ReasoningGraph,
-};
+use crate::report::{ExecutionReport, QueryOutcome};
 
 use super::details;
 use super::layout::{GraphLayout, NODE_HEIGHT, NODE_WIDTH};
+use super::model::{
+    DisplayNodeId, ExplanationGraph, ExplanationLink, LinkKind, NodeKind,
+    outcome_name,
+};
 
-const QUERY_NODE: NodeId = 5_000_000_000;
-
-struct CachedLayout
+struct CachedDiagram
 {
     revision: u64,
-    query: char,
+    query: usize,
+    graph: ExplanationGraph,
     layout: GraphLayout,
 }
 
 pub struct GraphViewer
 {
     query_index: usize,
-    selected_node: Option<NodeId>,
-    layout: Option<CachedLayout>,
+    selection: Option<DisplayNodeId>,
+    cached: Option<CachedDiagram>,
     zoom: f32,
-    show_search_links: bool,
 }
 
 impl Default for GraphViewer
@@ -37,210 +38,365 @@ impl Default for GraphViewer
     {
         Self {
             query_index: 0,
-            selected_node: None,
-            layout: None,
-            zoom: 0.90,
-            show_search_links: false,
+            selection: None,
+            cached: None,
+            zoom: 0.9,
         }
     }
 }
 
-fn category_fill(kind: &GraphNodeKind) -> egui::Color32
+fn fill(kind: NodeKind) -> egui::Color32
 {
     match kind
     {
-        GraphNodeKind::InitialFact { .. } => egui::Color32::from_rgb(43, 113, 85),
-        GraphNodeKind::Rule { .. } => egui::Color32::from_rgb(49, 91, 147),
-        GraphNodeKind::Constraint { .. } => egui::Color32::from_rgb(144, 99, 41),
-        GraphNodeKind::Deduction { .. } => egui::Color32::from_rgb(91, 69, 148),
-        GraphNodeKind::Query { .. } => egui::Color32::from_rgb(39, 110, 126),
-        GraphNodeKind::SearchGoal { .. } => egui::Color32::from_rgb(77, 83, 97),
-        _ => egui::Color32::from_rgb(83, 83, 97),
+        NodeKind::Answer => egui::Color32::from_rgb(24, 112, 123),
+        NodeKind::Fact => egui::Color32::from_rgb(31, 118, 86),
+        NodeKind::Rule => egui::Color32::from_rgb(57, 87, 155),
+        NodeKind::Clause => egui::Color32::from_rgb(150, 103, 39),
+        NodeKind::Derived => egui::Color32::from_rgb(103, 76, 163),
+        NodeKind::Notice => egui::Color32::from_rgb(94, 98, 108),
     }
 }
 
-fn edge_is_evidence(kind: EdgeKind) -> bool
+fn edge_color(link: LinkKind) -> egui::Color32
 {
-    matches!(
-        kind,
-        EdgeKind::Justification
-            | EdgeKind::PremiseDependency
-            | EdgeKind::ConstraintActivation
-            | EdgeKind::UnitPropagation
-    )
-}
-
-fn query_status(outcome: &QueryOutcome) -> String
-{
-    match outcome
+    match link
     {
-        QueryOutcome::Value(value) => format!("{value:?}"),
-        QueryOutcome::Error { .. } => "Error".to_owned(),
+        LinkKind::RulesOut => egui::Color32::from_rgb(236, 156, 91),
+        LinkKind::Unresolved => egui::Color32::from_rgb(212, 177, 98),
+        LinkKind::Answer => egui::Color32::from_rgb(95, 194, 195),
+        _ => egui::Color32::from_rgb(147, 159, 176),
     }
 }
 
-fn short_label(label: &str) -> String
+fn wrap_lines(value: &str, width: usize, limit: usize) -> String
 {
-    const MAX_CHARS: usize = 21;
-    let mut chars = label.chars();
-    let text = chars.by_ref().take(MAX_CHARS).collect::<String>();
-    if chars.next().is_some()
+    let mut lines = Vec::<String>::new();
+    let mut current = String::new();
+    let mut remaining = value.split_whitespace().peekable();
+
+    while let Some(word) = remaining.next()
     {
-        format!("{text}…")
+        let current_len = current.chars().count();
+        let word_len = word.chars().count();
+        if current_len > 0 && current_len + 1 + word_len > width
+        {
+            lines.push(current);
+            current = String::new();
+            if lines.len() == limit
+            {
+                let last = lines.last_mut().unwrap();
+                if !last.ends_with('…')
+                {
+                    last.push('…');
+                }
+                return lines.join("\n");
+            }
+        }
+
+        if !current.is_empty()
+        {
+            current.push(' ');
+        }
+
+        // Avoid rendering beyond the card even for expressions without
+        // whitespace (e.g. an unusually long conjunction).
+        if word_len > width
+        {
+            let clipped = word.chars().take(width.saturating_sub(1))
+                .collect::<String>();
+            current.push_str(&clipped);
+            current.push('…');
+            if remaining.peek().is_some()
+            {
+                lines.push(current);
+                current = String::new();
+                if lines.len() == limit
+                {
+                    return lines.join("\n");
+                }
+            }
+        }
+        else
+        {
+            current.push_str(word);
+        }
     }
-    else
+
+    if !current.is_empty()
     {
-        text
+        lines.push(current);
     }
+    if lines.is_empty()
+    {
+        return String::new();
+    }
+    lines.truncate(limit);
+    lines.join("\n")
 }
 
 fn draw_arrow(
     painter: &egui::Painter,
     source: egui::Rect,
     target: egui::Rect,
-    stroke: egui::Stroke,
+    link: &ExplanationLink,
+    selected: bool,
 )
 {
-    let (start, end, horizontal) = if source.center().x + 25.0 < target.center().x
+    let stroke = egui::Stroke::new(
+        if selected { 2.5 } else { 1.35 },
+        if selected
+        {
+            egui::Color32::from_rgb(248, 206, 105)
+        }
+        else
+        {
+            edge_color(link.kind)
+        },
+    );
+
+    let (start, end, horizontal) = if source.right() + 10.0 < target.left()
     {
         (source.right_center(), target.left_center(), true)
     }
-    else if target.center().x + 25.0 < source.center().x
-    {
-        (source.left_center(), target.right_center(), true)
-    }
-    else if source.center().y < target.center().y
+    else
     {
         (source.center_bottom(), target.center_top(), false)
+    };
+
+    let bend = if horizontal
+    {
+        (start.x + end.x) * 0.5
     }
     else
     {
-        (source.center_top(), target.center_bottom(), false)
+        (start.y + end.y) * 0.5
     };
 
     let points = if horizontal
     {
-        let halfway = (start.x + end.x) * 0.5;
         vec![
             start,
-            egui::pos2(halfway, start.y),
-            egui::pos2(halfway, end.y),
+            egui::pos2(bend, start.y),
+            egui::pos2(bend, end.y),
             end,
         ]
     }
     else
     {
-        let halfway = (start.y + end.y) * 0.5;
         vec![
             start,
-            egui::pos2(start.x, halfway),
-            egui::pos2(end.x, halfway),
+            egui::pos2(start.x, bend),
+            egui::pos2(end.x, bend),
             end,
         ]
     };
 
-    painter.add(egui::Shape::line(points.clone(), stroke));
-
-    let previous = points[points.len() - 2];
-    let displacement = end - previous;
-    if displacement.length_sq() > 0.1
+    if link.kind == LinkKind::Unresolved
     {
-        let direction = displacement.normalized();
-        let perpendicular = egui::vec2(-direction.y, direction.x);
-        let left = end - direction * 9.0 + perpendicular * 4.0;
-        let right = end - direction * 9.0 - perpendicular * 4.0;
-        painter.line_segment([left, end], stroke);
-        painter.line_segment([right, end], stroke);
+        // Gaps distinguish an unresolved relationship from a proof.
+        for segment in points.windows(2)
+        {
+            let delta = segment[1] - segment[0];
+            let length = delta.length();
+            if length <= 0.1
+            {
+                continue;
+            }
+            let direction = delta / length;
+            let mut offset = 0.0;
+            while offset < length
+            {
+                let finish = (offset + 6.0_f32).min(length);
+                painter.line_segment(
+                    [
+                        segment[0] + direction * offset,
+                        segment[0] + direction * finish,
+                    ],
+                    stroke,
+                );
+                offset += 11.0;
+            }
+        }
+    }
+    else
+    {
+        painter.add(egui::Shape::line(points.clone(), stroke));
+    }
+
+    let back = end - points[points.len() - 2];
+    if back.length_sq() > 0.001
+    {
+        let direction = back.normalized();
+        let normal = egui::vec2(-direction.y, direction.x);
+        painter.line_segment(
+            [end - direction * 11.0 + normal * 5.0, end],
+            stroke,
+        );
+        painter.line_segment(
+            [end - direction * 11.0 - normal * 5.0, end],
+            stroke,
+        );
+    }
+
+    if selected
+    {
+        let anchor = if horizontal
+        {
+            egui::pos2(bend, (start.y + end.y) * 0.5)
+        }
+        else
+        {
+            egui::pos2((start.x + end.x) * 0.5, bend)
+        };
+
+        let galley = painter.layout_no_wrap(
+            link.kind.label().to_owned(),
+            egui::FontId::proportional(12.0),
+            egui::Color32::WHITE,
+        );
+        let label_rect = egui::Rect::from_center_size(
+            anchor,
+            galley.size() + egui::vec2(12.0, 7.0),
+        );
+        painter.rect_filled(
+            label_rect, 4.0, egui::Color32::from_rgb(48, 54, 64),
+        );
+        painter.galley(
+            label_rect.center() - galley.size() * 0.5,
+            galley,
+            egui::Color32::WHITE,
+        );
     }
 }
 
-fn draw_canvas(
-    ui: &mut egui::Ui,
-    data: &ReasoningGraph,
-    layout: &GraphLayout,
-    selected_node: &mut Option<NodeId>,
+fn draw_card(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    node: &super::model::ExplanationNode,
     zoom: f32,
-    show_search_links: bool,
-    query_symbol: char,
+    selected: bool,
+    hovered: bool,
 )
 {
-    let canvas_size = egui::vec2(
-        (layout.width * zoom).max(ui.available_width()),
-        (layout.height * zoom).max(ui.available_height()),
+    let border = if selected
+    {
+        egui::Stroke::new(3.1, egui::Color32::from_rgb(251, 204, 95))
+    }
+    else if hovered
+    {
+        egui::Stroke::new(2.1, egui::Color32::WHITE)
+    }
+    else
+    {
+        egui::Stroke::new(1.0, egui::Color32::from_rgb(137, 148, 167))
+    };
+
+    painter.rect_filled(rect, 10.0 * zoom, fill(node.kind));
+    painter.rect_stroke(
+        rect, 10.0 * zoom, border, egui::StrokeKind::Inside,
     );
+
+    let left = rect.left() + 14.0 * zoom;
+    let top = rect.top() + 10.0 * zoom;
+
+    painter.text(
+        egui::pos2(left, top),
+        egui::Align2::LEFT_TOP,
+        node.kind.name(),
+        egui::FontId::proportional(10.5 * zoom),
+        egui::Color32::from_rgb(219, 231, 238),
+    );
+
+    painter.text(
+        egui::pos2(left, top + 20.0 * zoom),
+        egui::Align2::LEFT_TOP,
+        wrap_lines(&node.title, 29, 2),
+        egui::FontId::proportional(15.0 * zoom),
+        egui::Color32::WHITE,
+    );
+
+    painter.text(
+        egui::pos2(left, top + 73.0 * zoom),
+        egui::Align2::LEFT_TOP,
+        wrap_lines(&node.subtitle, 44, 2),
+        egui::FontId::proportional(10.5 * zoom),
+        egui::Color32::from_rgb(224, 230, 234),
+    );
+}
+
+fn canvas(
+    ui: &mut egui::Ui,
+    graph: &ExplanationGraph,
+    layout: &GraphLayout,
+    selection: &mut Option<DisplayNodeId>,
+    zoom: f32,
+    scroll_revision: (u64, usize),
+)
+{
+    let available = ui.available_size();
+    let width = available.x.max(200.0);
+    let height = available.y.max(170.0);
 
     egui::Frame::group(ui.style()).show(ui, |ui|
     {
         egui::ScrollArea::both()
-            .id_salt("read_only_reasoning_canvas")
+            .id_salt(("explanation_canvas", scroll_revision))
             .auto_shrink([false, false])
+            .max_width(width)
+            .max_height(height)
             .scroll_bar_visibility(
                 egui::containers::scroll_area::ScrollBarVisibility::AlwaysVisible
             )
             .show(ui, |ui|
             {
-                let (allocated, painter) = ui.allocate_painter(
-                    canvas_size,
-                    egui::Sense::hover(),
+                let canvas_size = egui::vec2(
+                    (layout.width * zoom).max(width - 20.0),
+                    (layout.height * zoom).max(height - 20.0),
                 );
-                let origin = allocated.rect.min;
-                let node_by_id: HashMap<NodeId, &GraphNode> =
-                    data.nodes.iter().map(|node| (node.id, node)).collect();
+                let (response, painter) = ui.allocate_painter(
+                    canvas_size, egui::Sense::hover(),
+                );
+                let origin = response.rect.min;
 
-                let node_rects: HashMap<NodeId, egui::Rect> = layout.nodes.iter()
-                    .map(|position|
-                    {
-                        let min = origin + egui::vec2(
-                            position.x * zoom,
-                            position.y * zoom,
-                        );
-                        let rect = egui::Rect::from_min_size(
-                            min,
-                            egui::vec2(NODE_WIDTH * zoom, NODE_HEIGHT * zoom),
-                        );
-                        (position.id, rect)
-                    })
-                    .collect();
-
-                // Edges must render first so they cannot obscure clickable
-                // nodes. Search/return paths are optional for readability.
-                for edge in &data.edges
+                let positions = layout.nodes.iter().map(|node|
                 {
-                    if !show_search_links && !edge_is_evidence(edge.kind)
-                    {
-                        continue;
-                    }
-
-                    let (Some(&start), Some(&end)) =
-                        (node_rects.get(&edge.from), node_rects.get(&edge.to))
-                    else
-                    {
-                        continue;
-                    };
-
-                    let selected = selected_node.is_some_and(|id|
-                    {
-                        edge.from == id || edge.to == id
-                    });
-                    let color = if selected
-                    {
-                        egui::Color32::from_rgb(245, 186, 91)
-                    }
-                    else
-                    {
-                        ui.visuals().weak_text_color().gamma_multiply(0.60)
-                    };
-
-                    let stroke = egui::Stroke::new(
-                        if selected { 2.2 } else { 1.0 },
-                        color,
+                    let position = origin + egui::vec2(
+                        node.x * zoom,
+                        node.y * zoom,
                     );
-                    draw_arrow(&painter, start, end, stroke);
+                    (
+                        node.id,
+                        egui::Rect::from_min_size(
+                            position,
+                            egui::vec2(NODE_WIDTH * zoom, NODE_HEIGHT * zoom),
+                        ),
+                    )
+                }).collect::<HashMap<_, _>>();
+
+                // Draw dependencies behind nodes and visually emphasize
+                // only connections touching the selected proof step.
+                for link in &graph.links
+                {
+                    if let (Some(from), Some(to)) =
+                        (positions.get(&link.from), positions.get(&link.to))
+                    {
+                        draw_arrow(
+                            &painter,
+                            *from,
+                            *to,
+                            link,
+                            selection.is_some_and(|id|
+                            {
+                                id == link.from || id == link.to
+                            }),
+                        );
+                    }
                 }
 
-                for node in &layout.nodes
+                for node in &graph.nodes
                 {
-                    let Some(&rect) = node_rects.get(&node.id) else
+                    let Some(rect) = positions.get(&node.id).copied() else
                     {
                         continue;
                     };
@@ -248,58 +404,50 @@ fn draw_canvas(
                     {
                         continue;
                     }
-                    let Some(record) = node_by_id.get(&node.id) else
-                    {
-                        continue;
-                    };
 
+                    // Click-only input: dragging is intentionally unavailable.
                     let hit = ui.interact(
                         rect,
-                        ui.id().with(("graph_node", query_symbol, node.id)),
+                        ui.id().with(("explanation_node", node.id)),
                         egui::Sense::click(),
                     );
                     if hit.clicked()
                     {
-                        *selected_node = Some(node.id);
+                        *selection = Some(node.id);
                     }
 
-                    let is_selected = *selected_node == Some(node.id);
-                    let fill = category_fill(&record.kind);
-                    let border = if is_selected
-                    {
-                        egui::Stroke::new(
-                            3.0,
-                            egui::Color32::from_rgb(245, 186, 91),
-                        )
-                    }
-                    else if hit.hovered()
-                    {
-                        egui::Stroke::new(2.0, egui::Color32::WHITE)
-                    }
-                    else
-                    {
-                        egui::Stroke::new(
-                            1.0,
-                            egui::Color32::from_rgb(153, 156, 166),
-                        )
-                    };
-
-                    painter.rect_filled(rect, 8.0, fill);
-                    painter.rect_stroke(
-                        rect, 8.0, border, egui::StrokeKind::Outside,
+                    draw_card(
+                        &painter,
+                        rect,
+                        node,
+                        zoom,
+                        *selection == Some(node.id),
+                        hit.hovered(),
                     );
 
-                    let label = short_label(&record.label);
-                    painter.text(
-                        rect.center(),
-                        egui::Align2::CENTER_CENTER,
-                        label,
-                        egui::FontId::proportional((14.0 * zoom).max(10.0)),
-                        egui::Color32::WHITE,
-                    );
-                    hit.on_hover_text(&record.label);
+                    hit.on_hover_text(format!(
+                        "{}\n{}\nClick for a full explanation",
+                        node.title, node.subtitle,
+                    ));
                 }
             });
+    });
+}
+
+fn legend(ui: &mut egui::Ui)
+{
+    ui.horizontal_wrapped(|ui|
+    {
+        ui.small("Read left → right: evidence → rule → deduction → answer.");
+        ui.separator();
+        for kind in [
+            NodeKind::Fact, NodeKind::Rule, NodeKind::Clause,
+            NodeKind::Derived, NodeKind::Answer, NodeKind::Notice,
+        ]
+        {
+            ui.colored_label(fill(kind), "●");
+            ui.small(kind.name());
+        }
     });
 }
 
@@ -314,143 +462,130 @@ impl GraphViewer
     {
         if report.queries.is_empty()
         {
-            ui.weak("The current run contains no queries.");
+            ui.weak("No queries were evaluated.");
             return;
         }
 
         self.query_index = self.query_index.min(report.queries.len() - 1);
-        let mut chosen = self.query_index;
+        let mut next_query = self.query_index;
 
         ui.horizontal_wrapped(|ui|
         {
-            ui.heading("Reasoning graph");
+            ui.heading("Why this result?");
             ui.separator();
-            ui.label("Query");
-
-            egui::ComboBox::from_id_salt("graph_query_selector")
-                .selected_text(
-                    format!(
-                        "{} — {}",
-                        report.queries[chosen].symbol,
-                        query_status(&report.queries[chosen].outcome)
-                    )
-                )
+            egui::ComboBox::from_id_salt("explanation_query_selector")
+                .selected_text(format!(
+                    "Query {} · {}",
+                    report.queries[next_query].symbol,
+                    outcome_name(&report.queries[next_query].outcome)
+                ))
                 .show_ui(ui, |ui|
                 {
                     for (index, query) in report.queries.iter().enumerate()
                     {
                         ui.selectable_value(
-                            &mut chosen, index,
-                            format!("{} — {}", query.symbol, query_status(&query.outcome)),
+                            &mut next_query,
+                            index,
+                            format!(
+                                "{} — {}",
+                                query.symbol,
+                                outcome_name(&query.outcome)
+                            ),
                         );
                     }
                 });
 
             ui.separator();
-
+            ui.label("Zoom");
             if ui.small_button("−").clicked()
             {
-                self.zoom = (self.zoom - 0.15).max(0.40);
+                self.zoom = (self.zoom - 0.10).max(0.70);
             }
-            ui.add(
-                egui::Slider::new(&mut self.zoom, 0.40..=1.60)
-                    .text("Zoom")
-                    .fixed_decimals(2)
-            );
+            ui.add(egui::Slider::new(&mut self.zoom, 0.70..=1.45)
+                .show_value(false));
             if ui.small_button("+").clicked()
             {
-                self.zoom = (self.zoom + 0.15).min(1.60);
+                self.zoom = (self.zoom + 0.10).min(1.45);
             }
-            ui.checkbox(&mut self.show_search_links, "Search links");
+            if ui.small_button("100%").clicked()
+            {
+                self.zoom = 1.0;
+            }
         });
 
-        if chosen != self.query_index
+        if next_query != self.query_index
         {
-            self.query_index = chosen;
-            self.layout = None;
-            self.selected_node = None;
+            self.query_index = next_query;
+            self.cached = None;
+            self.selection = None;
         }
 
-        let query = &report.queries[self.query_index];
-        if self.layout.as_ref().is_none_or(|cache|
-            cache.revision != revision || cache.query != query.symbol)
+        if self.cached.as_ref().is_none_or(|cache|
         {
-            self.layout = Some(CachedLayout {
+            cache.revision != revision || cache.query != self.query_index
+        })
+        {
+            let graph = ExplanationGraph::new(
+                report, &report.queries[self.query_index],
+            );
+            let layout = GraphLayout::new(&graph);
+            self.selection = Some(graph.root);
+            self.cached = Some(CachedDiagram {
                 revision,
-                query: query.symbol,
-                layout: GraphLayout::new(&query.graph),
+                query: self.query_index,
+                graph,
+                layout,
             });
-            self.selected_node = query.graph.nodes.iter()
-                .find(|node| matches!(node.kind, GraphNodeKind::Query { .. }))
-                .map(|node| node.id)
-                .or(Some(QUERY_NODE));
         }
 
-        let layout = &self.layout.as_ref().unwrap().layout;
+        let cache = self.cached.as_ref().unwrap();
+        let query = &report.queries[self.query_index];
+
+        legend(ui);
         ui.small(format!(
-            "{} nodes · {} connections · Click a node to inspect · Layout is fixed",
-            query.graph.nodes.len(),
-            query.graph.edges.len(),
+            "Focused explanation: {} steps, {} connections · {} trace events recorded. Click a card for details.",
+            cache.graph.nodes.len(),
+            cache.graph.links.len(),
+            query.trace.events.len(),
         ));
+
+        if cache.graph.limited
+        {
+            ui.colored_label(
+                egui::Color32::from_rgb(219, 164, 95),
+                "This proof is very large: the canvas shows the first 280 causal steps. The complete trace remains available.",
+            );
+        }
+
         ui.separator();
 
-        // The inspector is right-aligned on desktop widths and below the
-        // graph on smaller windows. Only the viewport scrolls; nodes do not
-        // support dragging or editing.
-        let available = ui.available_size();
-        if available.x >= 920.0
-        {
-            let inspect_width = 310.0;
-            ui.horizontal(|ui|
+        // Use an actual constrained side panel. The former allocate_ui()
+        // arrangement let long Debug strings increase the inspector width
+        // and render off the right edge of the window.
+        egui::SidePanel::right("proof_explanation_inspector")
+            .resizable(true)
+            .default_width(370.0)
+            .min_width(285.0)
+            .max_width(520.0)
+            .show_inside(ui, |ui|
             {
-                ui.allocate_ui(
-                    egui::vec2((available.x - inspect_width - 14.0).max(300.0), available.y),
-                    |ui|
-                    {
-                        draw_canvas(
-                            ui,
-                            &query.graph,
-                            layout,
-                            &mut self.selected_node,
-                            self.zoom,
-                            self.show_search_links,
-                            query.symbol,
-                        );
-                    },
-                );
-                ui.separator();
-                ui.allocate_ui(
-                    egui::vec2(inspect_width, available.y),
-                    |ui|
-                    {
-                        details::show(
-                            ui, report, query, &mut self.selected_node,
-                        );
-                    },
+                details::show(
+                    ui,
+                    report,
+                    query,
+                    &cache.graph,
+                    &mut self.selection,
                 );
             });
-        }
-        else
-        {
-            let canvas_height = (available.y * 0.63).max(210.0);
-            ui.allocate_ui(
-                egui::vec2(available.x, canvas_height),
-                |ui|
-                {
-                    draw_canvas(
-                        ui,
-                        &query.graph,
-                        layout,
-                        &mut self.selected_node,
-                        self.zoom,
-                        self.show_search_links,
-                        query.symbol,
-                    );
-                },
-            );
-            ui.separator();
-            details::show(ui, report, query, &mut self.selected_node);
-        }
+
+        canvas(
+            ui,
+            &cache.graph,
+            &cache.layout,
+            &mut self.selection,
+            self.zoom,
+            (revision, self.query_index),
+        );
     }
 }
 
@@ -460,17 +595,23 @@ mod tests
     use super::*;
 
     #[test]
-    fn empty_viewer_has_no_selection()
+    fn text_wrapping_is_bounded_and_unicode_safe()
     {
-        let viewer = GraphViewer::default();
-        assert_eq!(viewer.selected_node, None);
-        assert_eq!(viewer.query_index, 0);
+        assert_eq!(wrap_lines("A => B", 30, 2), "A => B");
+        let long = wrap_lines(
+            "A + B + C + D + E + F + G => H", 15, 2,
+        );
+        assert!(long.lines().count() <= 2);
+        assert!(long.contains('…'));
+        assert!(wrap_lines("Réécriture extrêmement longue", 12, 2)
+            .lines().count() <= 2);
     }
 
     #[test]
-    fn label_truncation_is_unicode_safe()
+    fn viewer_is_not_initially_bound_to_old_query_results()
     {
-        assert_eq!(short_label("A"), "A");
-        assert!(short_label("Réécriture très très longue").ends_with('…'));
+        let viewer = GraphViewer::default();
+        assert!(viewer.cached.is_none());
+        assert!(viewer.selection.is_none());
     }
 }
