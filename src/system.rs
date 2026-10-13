@@ -24,6 +24,11 @@ struct EvaluationCtx
     constraint_activation: Vec<Option<EventId>>,
     last_evidence: Vec<EventId>,
     constraint_last_evaluation: Vec<Option<EventId>>,
+    /// Failed proof searches that did not encounter cycles can be reused
+    /// until new facts or constraints change the knowledge state.
+    failed_search_at: [Option<u64>; 52],
+    knowledge_revision: u64,
+    cycle_count: u64,
 }
 
 #[derive(Debug)]
@@ -182,6 +187,9 @@ impl EvaluationCtx
             constraint_activation: Vec::new(),
             last_evidence: Vec::new(),
             constraint_last_evaluation: Vec::new(),
+            failed_search_at: [None; 52],
+            knowledge_revision: 0,
+            cycle_count: 0,
         }
     }
 }
@@ -331,6 +339,12 @@ impl<'a> System<'a>
             return false;
         }
         
+        // A newly active constraint may make previously unreachable
+        // deductions possible, so cached negative searches are invalidated.
+        if eval_ctx.constraints[rule_idx].is_none()
+        {
+            eval_ctx.knowledge_revision = eval_ctx.knowledge_revision.wrapping_add(1);
+        }
         eval_ctx.constraints[rule_idx] = Some(set);
         true
     }
@@ -415,6 +429,7 @@ impl<'a> System<'a>
             _ => unreachable!(),
         }
 
+        eval_ctx.knowledge_revision = eval_ctx.knowledge_revision.wrapping_add(1);
         let literal = Literal { symbol, positive: target == FactState::True };
         let event = Self::emit(eval_ctx, TraceEventKind::LiteralProven { literal, origin }, causes);
         if let Some(id) = event
@@ -428,7 +443,7 @@ impl<'a> System<'a>
     fn emit(ctx: &mut EvaluationCtx, kind: TraceEventKind, causes: Vec<EventId>) -> Option<EventId>
     {
         let attempt_id = ctx.attempt_stack.last().copied();
-        ctx.trace.as_mut().map(|trace| trace.record(attempt_id, kind, causes))
+        ctx.trace.as_mut().and_then(|trace| trace.record(attempt_id, kind, causes))
     }
 
     fn mark_from_rule(ctx: &mut EvaluationCtx, symbol: char, state: FactState, rule_id: usize, causes: Vec<EventId>) -> bool
@@ -888,11 +903,20 @@ impl<'a> System<'a>
             return Ok(true);
         }
 
+        let memo_slot = index * 2 + usize::from(target_state == FactState::False);
+        if eval_ctx.failed_search_at[memo_slot] == Some(eval_ctx.knowledge_revision)
+        {
+            return Ok(false);
+        }
+
         let visiting_key = (symbol, target_state);
         let literal = Literal { symbol, positive: target_state == FactState::True };
 
         if eval_ctx.visiting.contains(&visiting_key)
         {
+            // A failed search that encountered an active recursion cycle is
+            // context-dependent and must not be memoized.
+            eval_ctx.cycle_count = eval_ctx.cycle_count.wrapping_add(1);
             if let Some(&previous_attempt) = eval_ctx.active_attempts.get(&visiting_key)
             {
                 let cycle = Self::emit(eval_ctx, TraceEventKind::CycleDetected { goal: literal, previous_attempt }, vec![]);
@@ -929,6 +953,8 @@ impl<'a> System<'a>
         }
 
         eval_ctx.visiting.insert(visiting_key);
+        let revision_on_entry = eval_ctx.knowledge_revision;
+        let cycles_on_entry = eval_ctx.cycle_count;
 
         let result = (|| -> Result<bool, String>
             {
@@ -1071,6 +1097,14 @@ impl<'a> System<'a>
             })();
 
         eval_ctx.visiting.remove(&visiting_key);
+        if matches!(result, Ok(false))
+            && eval_ctx.knowledge_revision == revision_on_entry
+            && eval_ctx.cycle_count == cycles_on_entry
+        {
+            // Fixed-point negative caching: valid only with unchanged
+            // knowledge and without any recursive cycle in this search.
+            eval_ctx.failed_search_at[memo_slot] = Some(revision_on_entry);
+        }
         if let Some(attempt_id) = attempt_id
         {
             let outcome = match &result
@@ -1286,7 +1320,19 @@ impl<'a> System<'a>
             Err(message) => QueryOutcome::Error { message },
         };
         let trace = ctx.trace.take().unwrap();
-        let graph = crate::report::ReasoningGraph::from_trace(&trace);
+        // A truncated trace is not a complete proof. Do not synthesize a
+        // misleading graph from its partial prefix.
+        let graph = if trace.truncated
+        {
+            crate::report::ReasoningGraph {
+                nodes: Vec::new(),
+                edges: Vec::new(),
+            }
+        }
+        else
+        {
+            crate::report::ReasoningGraph::from_trace(&trace)
+        };
         QueryExecution { symbol, outcome, trace, graph }
     }
 
