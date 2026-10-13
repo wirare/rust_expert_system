@@ -726,6 +726,36 @@ mod tests
     }
 
     #[test]
+    fn a_rule_activates_its_own_or_clause_and_not_another_clause()
+    {
+        // Minimal reproduction of the incorrectly rendered A => (E | K)
+        // edge. Only !K may rule out K, and only A's rule activates E | K.
+        let graph = explanation("A=>E|K\nB=>!K\n=AB\n?E");
+
+        let applied = graph.nodes.iter().find(|node|
+            node.kind == NodeKind::Rule && node.title.contains("E | K")
+        ).expect("applied A=>E|K rule");
+        let clause = graph.nodes.iter().find(|node|
+            node.kind == NodeKind::Clause && node.title == "E | K"
+        ).expect("activated E|K clause");
+        let refutation = graph.nodes.iter().find(|node|
+            node.literal == Some(Literal {symbol:'K', positive:false})
+        ).expect("explicit !K");
+
+        assert!(graph.links.iter().any(|edge|
+            edge.from == applied.id && edge.to == clause.id
+                && edge.kind == LinkKind::Activates
+        ));
+        assert!(graph.links.iter().any(|edge|
+            edge.from == refutation.id && edge.to == clause.id
+                && edge.kind == LinkKind::RulesOut
+        ));
+        assert!(!graph.links.iter().any(|edge|
+            edge.from == applied.id && edge.kind == LinkKind::RulesOut
+        ));
+    }
+
+    #[test]
     fn rules_out_edges_only_come_from_explicit_literal_refutations()
     {
         // Exercises the exact overlapping E|K and !K|L clause pattern
