@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use eframe::egui;
 
 use crate::report::ExecutionReport;
+use crate::engine::RunReport;
 use crate::trace::LogicValue;
 
 use super::details;
@@ -15,7 +16,7 @@ use super::layout::{GraphLayout, NODE_HEIGHT, NODE_WIDTH};
 use super::routing::{self, EntryPort, RoutedEdge};
 use super::model::{
     DisplayNodeId, ExplanationGraph, ExplanationLink, LinkKind, NodeKind,
-    outcome_name, conflicting_symbols,
+    conflicting_symbols,
 };
 
 struct CachedDiagram
@@ -24,6 +25,8 @@ struct CachedDiagram
     query: usize,
     graph: ExplanationGraph,
     layout: GraphLayout,
+    /// Only the selected query and small shared rewrite metadata are in RAM.
+    report: ExecutionReport,
 }
 
 pub struct GraphViewer
@@ -31,6 +34,7 @@ pub struct GraphViewer
     query_index: usize,
     selection: Option<DisplayNodeId>,
     cached: Option<CachedDiagram>,
+    load_error: Option<String>,
     zoom: f32,
 }
 
@@ -42,6 +46,7 @@ impl Default for GraphViewer
             query_index: 0,
             selection: None,
             cached: None,
+            load_error: None,
             zoom: 0.9,
         }
     }
@@ -462,22 +467,34 @@ fn legend(ui: &mut egui::Ui)
     });
 }
 
+fn value_name(value: &Result<LogicValue, String>) -> &'static str
+{
+    match value
+    {
+        Ok(LogicValue::True) => "TRUE",
+        Ok(LogicValue::False) => "FALSE",
+        Ok(LogicValue::Undetermined) => "UNDETERMINED",
+        Ok(LogicValue::Contradiction) => "CONTRADICTION",
+        Err(_) => "ERROR",
+    }
+}
+
 impl GraphViewer
 {
     pub fn show(
         &mut self,
         ui: &mut egui::Ui,
-        report: &ExecutionReport,
+        run: &RunReport,
         revision: u64,
     )
     {
-        if report.queries.is_empty()
+        if run.results.is_empty()
         {
             ui.weak("No queries were evaluated.");
             return;
         }
 
-        self.query_index = self.query_index.min(report.queries.len() - 1);
+        self.query_index = self.query_index.min(run.results.len() - 1);
         let mut next_query = self.query_index;
 
         ui.horizontal_wrapped(|ui|
@@ -487,12 +504,12 @@ impl GraphViewer
             egui::ComboBox::from_id_salt("explanation_query_selector")
                 .selected_text(format!(
                     "Query {} · {}",
-                    report.queries[next_query].symbol,
-                    outcome_name(&report.queries[next_query].outcome)
+                    run.results[next_query].symbol,
+                    value_name(&run.results[next_query].value)
                 ))
                 .show_ui(ui, |ui|
                 {
-                    for (index, query) in report.queries.iter().enumerate()
+                    for (index, query) in run.results.iter().enumerate()
                     {
                         ui.selectable_value(
                             &mut next_query,
@@ -500,7 +517,7 @@ impl GraphViewer
                             format!(
                                 "{} — {}",
                                 query.symbol,
-                                outcome_name(&query.outcome)
+                                value_name(&query.value)
                             ),
                         );
                     }
@@ -528,6 +545,7 @@ impl GraphViewer
         {
             self.query_index = next_query;
             self.cached = None;
+            self.load_error = None;
             self.selection = None;
         }
 
@@ -536,21 +554,60 @@ impl GraphViewer
             cache.revision != revision || cache.query != self.query_index
         })
         {
-            let graph = ExplanationGraph::new(
-                report, &report.queries[self.query_index],
-            );
-            let layout = GraphLayout::new(&graph);
-            self.selection = Some(graph.root);
-            self.cached = Some(CachedDiagram {
-                revision,
-                query: self.query_index,
-                graph,
-                layout,
-            });
+            self.cached = None;
+            self.load_error = None;
+
+            // Decode only the chosen query; all other JSON query entries
+            // are skipped by the streaming reader without allocating them.
+            match run.report.load_query(self.query_index)
+            {
+                Ok(report) =>
+                {
+                    let query = &report.queries[0];
+                    if query.trace.truncated
+                    {
+                        self.load_error = Some(format!(
+                            "Trace for {} exceeded its {}-event recording budget. \
+The result is still valid, but the incomplete trace cannot produce a \
+trustworthy proof graph.",
+                            query.symbol,
+                            crate::trace::MAX_TRACE_EVENTS_PER_QUERY,
+                        ));
+                    }
+                    else
+                    {
+                        let graph = ExplanationGraph::new(&report, query);
+                        let layout = GraphLayout::new(&graph);
+                        self.selection = Some(graph.root);
+                        self.cached = Some(CachedDiagram {
+                            revision,
+                            query: self.query_index,
+                            graph,
+                            layout,
+                            report,
+                        });
+                    }
+                }
+                Err(error) => self.load_error = Some(error),
+            }
         }
 
-        let cache = self.cached.as_ref().unwrap();
-        let query = &report.queries[self.query_index];
+        if let Some(error) = &self.load_error
+        {
+            ui.colored_label(
+                egui::Color32::from_rgb(244, 158, 96),
+                error,
+            );
+            ui.weak("Select a different query or run the engine again.");
+            return;
+        }
+
+        let Some(cache) = self.cached.as_ref() else
+        {
+            ui.weak("No graph data available for this query.");
+            return;
+        };
+        let query = &cache.report.queries[0];
 
         legend(ui);
         ui.small(format!(
@@ -594,7 +651,7 @@ These are diagnostic conflicts, not automatically prerequisites of this proof.",
             {
                 details::show(
                     ui,
-                    report,
+                    &cache.report,
                     query,
                     &cache.graph,
                     &mut self.selection,
