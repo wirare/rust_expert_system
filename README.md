@@ -97,6 +97,29 @@ cargo run --release -- test.txt --report reasoning.json
 cargo run --release -- test.txt --report-pretty reasoning.json
 ```
 
+## Disk-backed traces and memory usage
+
+Both CLI `--report` and `--report-pretty` serialize **one query at a time**.
+After a query has been evaluated, its trace and reasoning graph are written
+to the JSON array and dropped before evaluating the next query. The output
+remains a single valid `ExecutionReport` JSON file with schema version 2.
+
+The GUI uses this same serializer to create a unique temporary JSON file
+in the operating system's temporary directory. It then uses a **streaming JSON
+reader** to load only the selected query when displaying a graph; the other
+queries are skipped without allocating their traces. The temporary report
+is automatically deleted when replaced or when the application exits.
+Running in parallel remains available for the normal inference results;
+the report pass is deliberately serialized to bound memory.
+
+A query records at most **4,000 trace events**. If the recording budget
+is exceeded, `trace.truncated` is set to `true`. The inference result
+remains valid, but the GUI explicitly declines to display a misleading
+partial proof graph. A truncated trace does not mean the answer itself was
+truncated.
+
+The Results pane separates the inference runtime and JSON-generation time.
+
 ## Code structure
 
 ```text
@@ -108,6 +131,7 @@ src/
   system.rs          parser, inference engine, sequential/parallel results
   trace.rs           execution trace types
   report.rs          report / graph serialization types
+  report_store.rs    temporary JSON creation and single-query streaming reader
   gui/
     mod.rs           GUI exports
     app.rs           workspace tabs, UI composition and controls
@@ -124,7 +148,8 @@ src/
 ```
 
 The GUI renders focused read-only proof explanations but does not yet support
-loading trace files, a timeline, or step-by-step playback. The solver runs inside
-a background worker on an owned source snapshot, keeping its borrowed AST
-lifetimes out of the UI state. `engine::RunReport::execution` contains full
-owned graph/rewrite/trace data for future features.
+user-selected trace-file import, a timeline, or step-by-step playback. The solver
+runs inside a background worker on an owned source snapshot, keeping its
+borrowed AST lifetimes out of the UI state. `engine::RunReport::report` owns
+a temporary JSON file and materializes one query on demand, providing the
+input for future trace and playback features without retaining every trace.
