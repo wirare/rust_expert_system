@@ -324,10 +324,10 @@ mod tests
         }).collect();
 
         let rule_a = graph.nodes.iter().find(|node|
-            node.kind == NodeKind::Rule && node.title.contains("(A => (E | K))")
+            node.kind == NodeKind::Rule && node.title == "A => (E | K)"
         ).expect("A=>E|K normalized rule");
         let rule_d = graph.nodes.iter().find(|node|
-            node.kind == NodeKind::Rule && node.title.contains("(D => (!K | L))")
+            node.kind == NodeKind::Rule && node.title == "D => (!K | L)"
         ).expect("D=>!K|L normalized rule");
         let clause_ek = graph.nodes.iter().find(|node|
             node.kind == NodeKind::Clause && node.title == "E | K"
