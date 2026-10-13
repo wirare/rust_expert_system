@@ -522,6 +522,7 @@ impl Builder<'_>
             {
                 continue;
             };
+            let established = *established;
 
             // Prove the *opposite* of another literal in this exact clause.
             // A rule or a different clause cannot constitute a refutation.
@@ -536,7 +537,7 @@ impl Builder<'_>
             for source in sources
             {
                 if self.output.node(source).is_some_and(|node|
-                    node.literal == Some(*established)
+                    node.literal == Some(established)
                         && matches!(node.kind, NodeKind::Fact | NodeKind::Derived))
                 {
                     self.link(source, clause_node, LinkKind::RulesOut);
