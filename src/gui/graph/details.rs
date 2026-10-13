@@ -13,7 +13,7 @@ use crate::trace::{
 
 use super::model::{
     DisplayNodeId, ExplanationGraph, ExplanationNode, LinkKind, NodeKind,
-    literal_text, outcome_name,
+    literal_text, outcome_name, rule_display_expression,
 };
 
 fn wrapped(ui: &mut egui::Ui, text: impl Into<String>)
@@ -52,6 +52,68 @@ fn outcome_description(outcome: &QueryOutcome) -> &'static str
     }
 }
 
+/// One proof uses one signed literal; the query may independently contain
+/// evidence for its opposite. Never imply the contradiction cancels this step.
+fn show_literal_status(
+    ui: &mut egui::Ui,
+    node: &ExplanationNode,
+    query: &QueryExecution,
+)
+{
+    let Some(literal) = node.literal else { return; };
+
+    section(ui, "Evidence used here");
+    ui.strong(format!(
+        "{} ({} proof)",
+        literal_text(literal),
+        if literal.positive { "positive" } else { "negative" },
+    ));
+
+    match node.observed_status
+    {
+        Some(LogicValue::Contradiction) =>
+        {
+            ui.colored_label(
+                egui::Color32::from_rgb(245, 183, 81),
+                format!("CONTRADICTION: {} and !{} both proven", literal.symbol, literal.symbol),
+            );
+            wrapped(ui, format!(
+                "This step still uses the {} proof of {}. The opposing proof \
+is recorded separately; it does not erase the evidence used by this rule.",
+                if literal.positive { "positive" } else { "negative" },
+                literal_text(literal),
+            ));
+
+            section(ui, "Opposing evidence (not a prerequisite)");
+            let mut count = 0;
+            for event in &query.trace.events
+            {
+                let TraceEventKind::LiteralProven {
+                    literal: other,
+                    origin,
+                } = &event.kind else { continue; };
+
+                if other.symbol != literal.symbol || other.positive == literal.positive
+                {
+                    continue;
+                }
+                wrapped(ui, format!(
+                    "Event #{}: {} proven ({origin:?})",
+                    event.id, literal_text(*other),
+                ));
+                count += 1;
+                if count == 3 { break; }
+            }
+        }
+        Some(LogicValue::True) =>
+            ui.small(format!("{} has recorded positive support in this query.", literal.symbol)),
+        Some(LogicValue::False) =>
+            ui.small(format!("!{} has recorded negative support in this query.", literal.symbol)),
+        _ =>
+            ui.small("No matching proof was recorded for this query."),
+    }
+}
+
 fn node_details(
     ui: &mut egui::Ui,
     node: &ExplanationNode,
@@ -59,6 +121,11 @@ fn node_details(
     query: &QueryExecution,
 )
 {
+    if matches!(node.kind, NodeKind::Fact | NodeKind::Derived)
+    {
+        show_literal_status(ui, node, query);
+    }
+
     match node.kind
     {
         NodeKind::Answer =>
@@ -100,7 +167,7 @@ fn node_details(
                 .find(|rule| rule.id == rule_id)
             {
                 section(ui, "Normalized expression");
-                code(ui, rule.expression.clone());
+                code(ui, rule_display_expression(&rule.expression).to_owned());
 
                 if let Some(original) = report.rewrite.original_rules.iter()
                     .find(|original| original.id == rule.original_rule_id)
@@ -472,6 +539,7 @@ mod tests
             event_id: None,
             rule_id: Some(2),
             literal: None,
+            observed_status: None,
         };
         assert_eq!(node.title, expression);
         assert_eq!(node.kind.name(), "RULE APPLIED");
