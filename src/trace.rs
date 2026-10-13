@@ -200,3 +200,42 @@ impl EvaluationTrace
         self.truncated || self.events.len() >= MAX_TRACE_EVENTS_PER_QUERY
     }
 }
+
+#[cfg(test)]
+mod bounds_tests
+{
+    use super::*;
+
+    #[test]
+    fn bounded_trace_drops_excess_events_without_growing()
+    {
+        let mut trace = EvaluationTrace::new('V');
+        for index in 0..MAX_TRACE_EVENTS_PER_QUERY
+        {
+            assert_eq!(
+                trace.record(None, TraceEventKind::RuleConsidered { rule_id: index }, vec![]),
+                Some(index as u64),
+            );
+        }
+
+        assert!(!trace.truncated);
+        assert_eq!(trace.events.len(), MAX_TRACE_EVENTS_PER_QUERY);
+        assert!(trace.record(None, TraceEventKind::RuleConsidered {
+            rule_id: MAX_TRACE_EVENTS_PER_QUERY,
+        }, vec![]).is_none());
+        assert!(trace.truncated);
+
+        for _ in 0..100_000
+        {
+            assert!(trace.record(None, TraceEventKind::RuleConsidered {
+                rule_id: 0,
+            }, vec![]).is_none());
+        }
+        assert_eq!(trace.events.len(), MAX_TRACE_EVENTS_PER_QUERY);
+
+        let serialized = serde_json::to_string(&trace).unwrap();
+        let recovered: EvaluationTrace = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(recovered.events.len(), MAX_TRACE_EVENTS_PER_QUERY);
+        assert!(recovered.truncated);
+    }
+}
