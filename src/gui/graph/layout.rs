@@ -11,11 +11,11 @@ use petgraph::visit::EdgeRef;
 
 use super::model::{DisplayNodeId, ExplanationGraph, NodeKind};
 
-pub const NODE_WIDTH: f32 = 282.0;
-pub const NODE_HEIGHT: f32 = 112.0;
-pub const COLUMN_GAP: f32 = 110.0;
-pub const ROW_GAP: f32 = 34.0;
-const PADDING: f32 = 52.0;
+pub const NODE_WIDTH: f32 = 310.0;
+pub const NODE_HEIGHT: f32 = 130.0;
+pub const COLUMN_GAP: f32 = 160.0;
+pub const ROW_GAP: f32 = 48.0;
+pub const PADDING: f32 = 102.0;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Placement
@@ -244,6 +244,20 @@ mod tests
 
         let again = GraphLayout::new(&explanation);
         assert_eq!(layout.nodes, again.nodes);
+    }
+
+    #[test]
+    fn layout_reserves_a_clear_routing_gutter_above_every_card()
+    {
+        let run = run_source(
+            "A=>B|C\nD=>!C\n=AD\n?B", SolveMode::Sequential,
+        ).unwrap();
+        let explanation = ExplanationGraph::new(
+            &run.execution, &run.execution.queries[0],
+        );
+        let layout = GraphLayout::new(&explanation);
+        assert!(layout.nodes.iter().all(|position| position.y >= PADDING));
+        assert!(layout.width >= NODE_WIDTH + PADDING * 2.0);
     }
 
     #[test]
