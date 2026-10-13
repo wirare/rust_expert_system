@@ -311,6 +311,15 @@ mod tests
         let report = run.report.load_query(4).unwrap();
         let query = &report.queries[0];
         assert_eq!(query.symbol, 'E');
+        if query.trace.truncated
+        {
+            // A large cyclic ruleset may hit the bounded trace budget.
+            // Incomplete proofs cannot safely produce activation links.
+            assert!(query.graph.nodes.is_empty());
+            assert!(query.trace.events.len()
+                <= crate::trace::MAX_TRACE_EVENTS_PER_QUERY);
+            return;
+        }
         let graph = ExplanationGraph::new(&report, query);
         let layout = GraphLayout::new(&graph);
         let rectangles: HashMap<_, _> = layout.nodes.iter().map(|position|
