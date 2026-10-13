@@ -106,11 +106,17 @@ is recorded separately; it does not erase the evidence used by this rule.",
             }
         }
         Some(LogicValue::True) =>
-            ui.small(format!("{} has recorded positive support in this query.", literal.symbol)),
+        {
+            ui.small(format!("{} has recorded positive support in this query.", literal.symbol));
+        }
         Some(LogicValue::False) =>
-            ui.small(format!("!{} has recorded negative support in this query.", literal.symbol)),
+        {
+            ui.small(format!("!{} has recorded negative support in this query.", literal.symbol));
+        }
         _ =>
-            ui.small("No matching proof was recorded for this query."),
+        {
+            ui.small("No matching proof was recorded for this query.");
+        }
     }
 }
 
