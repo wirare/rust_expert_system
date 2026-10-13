@@ -227,8 +227,9 @@ mod tests
     fn dependencies_flow_left_to_right()
     {
         let run = run_source("A=>B\n=A\n?B", SolveMode::Sequential).unwrap();
+        let report = run.report.load_query(0).unwrap();
         let explanation = ExplanationGraph::new(
-            &run.execution, &run.execution.queries[0],
+            &report, &report.queries[0],
         );
         let layout = GraphLayout::new(&explanation);
         assert_eq!(layout.nodes.len(), explanation.nodes.len());
@@ -252,8 +253,9 @@ mod tests
         let run = run_source(
             "A=>B|C\nD=>!C\n=AD\n?B", SolveMode::Sequential,
         ).unwrap();
+        let report = run.report.load_query(0).unwrap();
         let explanation = ExplanationGraph::new(
-            &run.execution, &run.execution.queries[0],
+            &report, &report.queries[0],
         );
         let layout = GraphLayout::new(&explanation);
         assert!(layout.nodes.iter().all(|position| position.y >= PADDING));
@@ -266,8 +268,9 @@ mod tests
         let run = run_source(
             "A=>B\nC=>!B\n=AC\n?B", SolveMode::Sequential,
         ).unwrap();
+        let report = run.report.load_query(0).unwrap();
         let explanation = ExplanationGraph::new(
-            &run.execution, &run.execution.queries[0],
+            &report, &report.queries[0],
         );
         let layout = GraphLayout::new(&explanation);
         let answer = layout.location(explanation.root).unwrap();
