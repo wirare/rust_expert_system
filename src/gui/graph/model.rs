@@ -205,6 +205,33 @@ pub fn outcome_name(outcome: &QueryOutcome) -> &'static str
     }
 }
 
+/// Contradictions observed while answering this query. They are shown as
+/// diagnostic warnings, not as causal proof edges for unrelated rules.
+pub fn conflicting_symbols(query: &QueryExecution) -> Vec<char>
+{
+    let mut polarities = [0_u8; 26];
+    for event in &query.trace.events
+    {
+        if let TraceEventKind::LiteralProven { literal, .. } = &event.kind
+        {
+            if literal.symbol.is_ascii_uppercase()
+            {
+                let index = literal.symbol as usize - 'A' as usize;
+                polarities[index] |= if literal.positive { 1 } else { 2 };
+            }
+        }
+    }
+
+    polarities.iter().enumerate().filter_map(|(index, &flags)|
+    {
+        if flags == 3
+        {
+            Some((b'A' + index as u8) as char)
+        }
+        else { None }
+    }).collect()
+}
+
 struct Builder<'a>
 {
     report: &'a ExecutionReport,
@@ -723,6 +750,14 @@ mod tests
         assert!(graph.nodes.iter().any(|node| node.kind == NodeKind::Clause));
         assert!(graph.links.iter().any(|edge| edge.kind == LinkKind::Forces));
         assert!(graph.links.iter().any(|edge| edge.kind == LinkKind::RulesOut));
+    }
+
+    #[test]
+    fn contradictory_premise_is_reported_without_becoming_a_false_prerequisite()
+    {
+        let run = run_source("C=>!R\nD=>!T\nR|T=>!C\n=CDR\n?C", SolveMode::Sequential).unwrap();
+        let query = &run.execution.queries[0];
+        assert_eq!(conflicting_symbols(query), vec!['C', 'R']);
     }
 
     #[test]
