@@ -300,6 +300,70 @@ mod tests
     }
 
     #[test]
+    fn real_large_ruleset_routes_each_rule_to_its_own_or_clause()
+    {
+        use crate::engine::{run_source, SolveMode};
+        use super::super::layout::{GraphLayout, NODE_HEIGHT, NODE_WIDTH};
+        use super::super::model::{ExplanationGraph, LinkKind, NodeKind};
+
+        let run = run_source(include_str!("../../../big_test.txt"), SolveMode::Sequential)
+            .unwrap();
+        let query = run.execution.queries.iter()
+            .find(|query| query.symbol == 'E').unwrap();
+        let graph = ExplanationGraph::new(&run.execution, query);
+        let layout = GraphLayout::new(&graph);
+        let rectangles: HashMap<_, _> = layout.nodes.iter().map(|position|
+        {
+            (
+                position.id,
+                egui::Rect::from_min_size(
+                    egui::pos2(position.x, position.y),
+                    egui::vec2(NODE_WIDTH, NODE_HEIGHT),
+                ),
+            )
+        }).collect();
+
+        let rule_a = graph.nodes.iter().find(|node|
+            node.kind == NodeKind::Rule && node.title.contains("(A => (E | K))")
+        ).expect("A=>E|K normalized rule");
+        let rule_d = graph.nodes.iter().find(|node|
+            node.kind == NodeKind::Rule && node.title.contains("(D => (!K | L))")
+        ).expect("D=>!K|L normalized rule");
+        let clause_ek = graph.nodes.iter().find(|node|
+            node.kind == NodeKind::Clause && node.title == "E | K"
+        ).expect("E|K clause");
+        let clause_kl = graph.nodes.iter().find(|node|
+            node.kind == NodeKind::Clause && node.title == "!K | L"
+        ).expect("!K|L clause");
+
+        for (rule, clause) in [(rule_a, clause_ek), (rule_d, clause_kl)]
+        {
+            assert!(graph.links.iter().any(|link|
+                link.from == rule.id && link.to == clause.id
+                    && link.kind == LinkKind::Activates));
+
+            let connection = route(rule.id, clause.id, &rectangles, 0, 1.0)
+                .expect("routable rule activation");
+            let start = rectangles[&rule.id];
+            let target = rectangles[&clause.id];
+            assert_eq!(connection.points.first().copied(), Some(start.right_center()));
+            assert_manhattan(&connection.points);
+
+            // The line must never end at some other constraint node.
+            let expected_tip = match connection.entry
+            {
+                EntryPort::Top => target.center_top(),
+                EntryPort::Bottom => target.center_bottom(),
+                EntryPort::Left => target.left_center(),
+            };
+            assert_eq!(connection.points.last().copied(), Some(expected_tip));
+            assert!(!obstructed(
+                &connection.points, &rectangles, rule.id, clause.id, 8.0,
+            ));
+        }
+    }
+
+    #[test]
     fn intermediate_card_forces_detour_without_overlap()
     {
         let map = HashMap::from([
