@@ -115,7 +115,7 @@ application exits normally.
 Running in parallel remains available for the normal inference results;
 the report pass is deliberately serialized to bound memory.
 
-A query records at most **4,000 trace events**. If the recording budget
+A query records at most **100,000 trace events**. If the recording budget
 is exceeded, `trace.truncated` is set to `true`. The inference result
 remains valid, but the GUI explicitly declines to display a misleading
 partial proof graph. A truncated trace does not mean the answer itself was
