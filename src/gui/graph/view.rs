@@ -10,7 +10,8 @@ use eframe::egui;
 use crate::report::ExecutionReport;
 
 use super::details;
-use super::layout::{GraphLayout, COLUMN_GAP, NODE_HEIGHT, NODE_WIDTH};
+use super::layout::{GraphLayout, NODE_HEIGHT, NODE_WIDTH};
+use super::routing::{self, EntryPort, RoutedEdge};
 use super::model::{
     DisplayNodeId, ExplanationGraph, ExplanationLink, LinkKind, NodeKind,
     outcome_name,
@@ -135,59 +136,11 @@ fn wrap_lines(value: &str, width: usize, limit: usize) -> String
     lines.join("\n")
 }
 
-/// Route edges through free corridors instead of drawing across nodes.
-/// Adjacent stages use a short elbow. Long-range dependencies go through
-/// the reserved top gutter, so they cannot cross intermediate card text.
-fn route_points(
-    source: egui::Rect,
-    target: egui::Rect,
-    scene_top: f32,
-    edge_index: usize,
-    zoom: f32,
-) -> Vec<egui::Pos2>
-{
-    let start = source.right_center();
-    let end = target.left_center();
-    let gap = end.x - start.x;
-    let adjacent = gap > 10.0 * zoom
-        && gap < COLUMN_GAP * zoom * 1.5;
-
-    if adjacent
-    {
-        let shift = (edge_index % 5) as f32 - 2.0;
-        let bend = ((start.x + end.x) * 0.5 + shift * 9.0 * zoom)
-            .clamp(start.x + 12.0 * zoom, end.x - 12.0 * zoom);
-        return vec![
-            start,
-            egui::pos2(bend, start.y),
-            egui::pos2(bend, end.y),
-            end,
-        ];
-    }
-
-    // Skip-layer, same-column, and backwards connections are sent around
-    // the cards instead of through their bounding rectangles.
-    let departure = start.x + COLUMN_GAP * zoom * 0.32;
-    let approach = end.x - COLUMN_GAP * zoom * 0.32;
-    let lane_y = scene_top + (20.0 + 13.0 * (edge_index % 5) as f32) * zoom;
-    vec![
-        start,
-        egui::pos2(departure, start.y),
-        egui::pos2(departure, lane_y),
-        egui::pos2(approach, lane_y),
-        egui::pos2(approach, end.y),
-        end,
-    ]
-}
-
 fn draw_arrow(
     painter: &egui::Painter,
-    source: egui::Rect,
-    target: egui::Rect,
+    route: &RoutedEdge,
     link: &ExplanationLink,
     selected: bool,
-    scene_top: f32,
-    edge_index: usize,
     zoom: f32,
 )
 {
@@ -203,7 +156,7 @@ fn draw_arrow(
         },
     );
 
-    let points = route_points(source, target, scene_top, edge_index, zoom);
+    let points = &route.points;
 
     if link.kind == LinkKind::Unresolved
     {
@@ -234,7 +187,7 @@ fn draw_arrow(
     }
     else
     {
-        painter.add(egui::Shape::line(points.clone(), stroke));
+        painter.add(egui::Shape::line(points.to_vec(), stroke));
     }
 
     let end = *points.last().unwrap();
@@ -252,6 +205,13 @@ fn draw_arrow(
             [end - direction * 11.0 - normal * 5.0, end],
             stroke,
         );
+    }
+
+    // A small arrival marker makes top/bottom clause entry unambiguous,
+    // particularly where multiple long links converge on the same card.
+    if matches!(route.entry, EntryPort::Top | EntryPort::Bottom)
+    {
+        painter.circle_filled(end, 2.4 * zoom, stroke.color);
     }
 
     // Edge labels intentionally live in the inspector, which has a bounded
@@ -383,23 +343,26 @@ fn canvas(
                 // only connections touching the selected proof step.
                 for (edge_index, link) in graph.links.iter().enumerate()
                 {
-                    if let (Some(from), Some(to)) =
-                        (positions.get(&link.from), positions.get(&link.to))
+                    let Some(route) = routing::route(
+                        link.from,
+                        link.to,
+                        &positions,
+                        edge_index,
+                        zoom,
+                    ) else
                     {
-                        draw_arrow(
-                            &painter,
-                            *from,
-                            *to,
-                            link,
-                            selection.is_some_and(|id|
-                            {
-                                id == link.from || id == link.to
-                            }),
-                            origin.y,
-                            edge_index,
-                            zoom,
-                        );
-                    }
+                        continue;
+                    };
+                    draw_arrow(
+                        &painter,
+                        &route,
+                        link,
+                        selection.is_some_and(|id|
+                        {
+                            id == link.from || id == link.to
+                        }),
+                        zoom,
+                    );
                 }
 
                 for node in &graph.nodes
@@ -612,43 +575,6 @@ mod tests
         assert!(long.contains('…'));
         assert!(wrap_lines("Réécriture extrêmement longue", 12, 2)
             .lines().count() <= 2);
-    }
-
-    #[test]
-    fn long_range_wire_uses_top_gutter_instead_of_crossing_cards()
-    {
-        let source = egui::Rect::from_min_size(
-            egui::pos2(80.0, 200.0),
-            egui::vec2(NODE_WIDTH, NODE_HEIGHT),
-        );
-        let target = egui::Rect::from_min_size(
-            egui::pos2(80.0 + 3.0 * (NODE_WIDTH + COLUMN_GAP), 420.0),
-            egui::vec2(NODE_WIDTH, NODE_HEIGHT),
-        );
-        let points = route_points(source, target, 50.0, 0, 1.0);
-        assert_eq!(points.first().copied(), Some(source.right_center()));
-        assert_eq!(points.last().copied(), Some(target.left_center()));
-        assert!(points.len() > 4);
-        assert!(points.iter().any(|point| point.y < source.top()));
-        assert!(points.iter().any(|point| point.y < target.top()));
-    }
-
-    #[test]
-    fn neighboring_stages_route_through_the_column_gap()
-    {
-        let source = egui::Rect::from_min_size(
-            egui::pos2(80.0, 210.0),
-            egui::vec2(NODE_WIDTH, NODE_HEIGHT),
-        );
-        let target = egui::Rect::from_min_size(
-            egui::pos2(80.0 + NODE_WIDTH + COLUMN_GAP, 410.0),
-            egui::vec2(NODE_WIDTH, NODE_HEIGHT),
-        );
-        let points = route_points(source, target, 0.0, 2, 1.0);
-        assert_eq!(points.len(), 4);
-        assert!(points[1].x > source.right());
-        assert!(points[1].x < target.left());
-        assert_eq!(points[1].x, points[2].x);
     }
 
     #[test]
