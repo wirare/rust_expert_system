@@ -753,6 +753,50 @@ mod tests
     }
 
     #[test]
+    fn big_test_query_v_with_b_c_d_r_does_not_use_negative_literals_to_prove_or()
+    {
+        use crate::engine::run_source_with_facts;
+
+        // Exact GUI scenario: source facts ABCD, A unchecked, R checked.
+        let source = include_str!("../../../big_test.txt")
+            .replace("?ABCDEFGHIJKLMNOPQRSTUVWXYZ", "?V");
+        let mut enabled = [false; 26];
+        for symbol in b"BCDR"
+        {
+            enabled[(symbol - b'A') as usize] = true;
+        }
+
+        let run = run_source_with_facts(&source, SolveMode::Sequential, enabled)
+            .unwrap();
+        let query = &run.execution.queries[0];
+        let graph = ExplanationGraph::new(&run.execution, query);
+
+        assert_eq!(query.symbol, 'V');
+        assert!(conflicting_symbols(query).contains(&'R'),
+            "C=>!R conflicts with enabled R");
+
+        // If this rule is present in the displayed proof, its incoming
+        // premises must be *positive* R or T, never !R or !T.
+        for applied_rule in graph.nodes.iter().filter(|node|
+            node.kind == NodeKind::Rule && node.title.contains("(R | T)")
+        )
+        {
+            let premises = graph.links.iter().filter(|link|
+                link.to == applied_rule.id && link.kind == LinkKind::Premise
+            ).filter_map(|link| graph.node(link.from)).collect::<Vec<_>>();
+
+            assert!(premises.iter().any(|node|
+                node.literal == Some(Literal { symbol: 'R', positive: true })
+                || node.literal == Some(Literal { symbol: 'T', positive: true })),
+                "R|T must have positive supporting evidence");
+            assert!(!premises.iter().any(|node|
+                node.literal == Some(Literal { symbol: 'R', positive: false })
+                || node.literal == Some(Literal { symbol: 'T', positive: false })),
+                "Negative literals cannot prove R|T");
+        }
+    }
+
+    #[test]
     fn contradictory_premise_is_reported_without_becoming_a_false_prerequisite()
     {
         let run = run_source("C=>!R\nD=>!T\nR|T=>!C\n=CDR\n?C", SolveMode::Sequential).unwrap();
