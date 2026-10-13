@@ -2,6 +2,7 @@
 
 mod details;
 mod layout;
+mod model;
 mod view;
 
 pub use view::GraphViewer;
