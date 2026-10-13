@@ -5,6 +5,10 @@ pub type AttemptId = u64;
 pub type RuleId = usize;
 pub type ConstraintId = usize;
 
+/// Maximum retained events per query. The inference engine keeps running after
+/// this limit; only tracing stops. This bounds CLI and GUI report memory.
+pub const MAX_TRACE_EVENTS_PER_QUERY: usize = 4_000;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Literal
 {
@@ -37,6 +41,10 @@ pub struct EvaluationTrace
     pub events: Vec<TraceEvent>,
     #[serde(default)]
     pub attempts: u64,
+    /// True if recording stopped at the per-query memory budget. The solver
+    /// result remains complete, but no proof graph may be trusted afterward.
+    #[serde(default)]
+    pub truncated: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -167,13 +175,28 @@ impl EvaluationTrace
 {
     pub fn new(query: char) -> Self
     {
-        Self { query, events: Vec::new(), attempts: 0 }
+        Self { query, events: Vec::new(), attempts: 0, truncated: false }
     }
 
-    pub fn record(&mut self, attempt_id: Option<AttemptId>, kind: TraceEventKind, causes: Vec<EventId>) -> EventId
+    pub fn record(
+        &mut self,
+        attempt_id: Option<AttemptId>,
+        kind: TraceEventKind,
+        causes: Vec<EventId>,
+    ) -> Option<EventId>
     {
+        if self.events.len() >= MAX_TRACE_EVENTS_PER_QUERY
+        {
+            self.truncated = true;
+            return None;
+        }
         let id = self.events.len() as EventId;
         self.events.push(TraceEvent { id, attempt_id, kind, causes });
-        id
+        Some(id)
+    }
+
+    pub fn is_full(&self) -> bool
+    {
+        self.truncated || self.events.len() >= MAX_TRACE_EVENTS_PER_QUERY
     }
 }
