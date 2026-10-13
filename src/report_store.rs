@@ -58,14 +58,12 @@ impl ReportStore
                 )),
             };
 
-            let result = system.write_execution_json(BufWriter::new(file), false);
-            if let Err(error) = result
-            {
-                let _ = std::fs::remove_file(&path);
-                return Err(format!("Unable to generate JSON report: {error}"));
-            }
-
-            return Ok(Self { path });
+            // Install the RAII guard *before* serializing, so errors and
+            // unwinding both remove a partial temporary report.
+            let store = Self { path };
+            system.write_execution_json(BufWriter::new(file), false)
+                .map_err(|error| format!("Unable to generate JSON report: {error}"))?;
+            return Ok(store);
         }
 
         Err("Unable to allocate a unique temporary JSON report".to_owned())
