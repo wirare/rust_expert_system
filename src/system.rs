@@ -1726,6 +1726,74 @@ mod inference_tests
     }
 
     #[test]
+    fn four_valued_operators_do_not_spread_contradictions_incorrectly()
+    {
+        // R and !R are established. They do not make R OR T false when
+        // T is true, and cannot make R AND T true when T is false.
+        assert_eq!(
+            System::do_operation(Operation::Or, FactState::Contradiction,
+                Some(FactState::True)),
+            FactState::True,
+        );
+        assert_eq!(
+            System::do_operation(Operation::And, FactState::Contradiction,
+                Some(FactState::False)),
+            FactState::False,
+        );
+        assert_eq!(
+            System::do_operation(Operation::Or, FactState::Contradiction,
+                Some(FactState::False)),
+            FactState::Contradiction,
+        );
+        assert_eq!(
+            System::do_operation(Operation::Not, FactState::Contradiction, None),
+            FactState::Contradiction,
+        );
+    }
+
+    #[test]
+    fn or_premise_uses_positive_witness_not_its_negative_proofs()
+    {
+        let source = "C=>!R\nD=>!T\nR|T=>!C\n=CDR\n?C";
+        let mut system = System::new();
+        parser(&mut system, source.lines().collect()).unwrap();
+        system.compute_rules_for_symbols();
+        let query = system.evaluate_traced('C');
+        assert!(matches!(query.outcome,
+            QueryOutcome::Value(crate::trace::LogicValue::Contradiction)));
+
+        let events = &query.trace.events;
+        let applied = events.iter().find(|event| matches!(&event.kind,
+            TraceEventKind::RuleApplied { rule_id }
+                if system.rewrite_history.normalized_rules[*rule_id].expression.contains("(R | T)")
+        )).expect("R | T implication was applied");
+        let premise = &events[applied.causes[0] as usize];
+        let expression = &events[premise.causes[0] as usize];
+        assert!(matches!(&expression.kind,
+            TraceEventKind::ExpressionEvaluated { expression, .. }
+                if expression.contains("(R | T)")
+        ));
+        let causal_literals = expression.causes.iter().filter_map(|&id|
+        {
+            if let TraceEventKind::LiteralProven { literal, .. } =
+                &events[id as usize].kind
+            {
+                Some(*literal)
+            }
+            else { None }
+        }).collect::<Vec<_>>();
+
+        assert_eq!(causal_literals,
+            vec![Literal { symbol:'R', positive:true }],
+            "Only positive R proves R | T; !R and !T are contrary evidence");
+        assert!(events.iter().any(|event|
+            matches!(&event.kind, TraceEventKind::LiteralProven {
+                literal: Literal { symbol:'R', positive:false }, ..
+            })
+        ), "Negative R proof is still recorded for contradiction inspection");
+    }
+
+    #[test]
     fn complex_input_export_keeps_graph_compact()
     {
         let input = include_str!("../test.txt");
