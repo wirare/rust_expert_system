@@ -345,9 +345,24 @@ fn link_button(
     {
         ui.small(format!("{arrow} {}", kind.label()));
         let width = ui.available_width().max(60.0);
+        // Button text is intentionally shortened: a long unbroken rule
+        // must not widen the inspector or overpaint its neighboring widgets.
+        let capacity = ((width / 7.5) as usize).clamp(8, 48);
+        let display = if node.title.chars().count() > capacity
+        {
+            format!(
+                "{}…",
+                node.title.chars().take(capacity.saturating_sub(1))
+                    .collect::<String>()
+            )
+        }
+        else
+        {
+            node.title.clone()
+        };
         let button = ui.add_sized(
             [width, 27.0],
-            egui::Button::new(node.title.as_str()),
+            egui::Button::new(display),
         );
         if button.clicked()
         {
