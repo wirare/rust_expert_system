@@ -293,14 +293,15 @@ impl Builder<'_>
         {
             TraceEventKind::LiteralProven { literal, origin } =>
             {
-                let (kind, subtitle, rule_id) = match origin
+                let forced_by_clause = matches!(&origin, ProofOrigin::UnitPropagation { .. });
+                let (kind, subtitle, rule_id) = match &origin
                 {
                     ProofOrigin::InitialFact =>
                         (NodeKind::Fact, "Enabled initial fact".into(), None),
                     ProofOrigin::Rule { rule_id } =>
-                        (NodeKind::Derived, format!("Directly inferred by rule #{rule_id}"), Some(rule_id)),
+                        (NodeKind::Derived, format!("Directly inferred by rule #{rule_id}"), Some(*rule_id)),
                     ProofOrigin::UnitPropagation { constraint_id } =>
-                        (NodeKind::Derived, format!("Forced by OR constraint #{constraint_id}"), Some(constraint_id)),
+                        (NodeKind::Derived, format!("Forced by OR constraint #{constraint_id}"), Some(*constraint_id)),
                 };
 
                 self.add_node(ExplanationNode {
@@ -315,7 +316,7 @@ impl Builder<'_>
 
                 let ancestors = causes.iter().flat_map(|cause| self.resolve(*cause))
                     .collect::<Vec<_>>();
-                if let ProofOrigin::UnitPropagation { .. } = origin
+                if forced_by_clause
                 {
                     // Other proven literals eliminate alternative choices.
                     // Show their support entering the clause rather than
