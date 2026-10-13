@@ -1,3 +1,6 @@
+use serde::ser::{SerializeSeq, SerializeStruct};
+use serde::{Serialize, Serializer};
+
 use crate::grammar;
 use crate::tokenizer::{Token, TokenType};
 use crate::ast::{ASTNode, build_ast, rpn, rewrite_with_history};
@@ -1355,28 +1358,38 @@ impl<'a> System<'a>
         }
     }
 
+    /// Serialize query-by-query rather than retaining every query's trace.
+    /// The output is the same ExecutionReport JSON schema as before.
+    pub fn write_execution_json<W: std::io::Write>(
+        &self,
+        mut writer: W,
+        pretty: bool,
+    ) -> Result<(), Box<dyn std::error::Error>>
+    {
+        self.validate_ready()
+            .map_err(std::io::Error::other)?;
+
+        let report = StreamingExecutionReport { system: self };
+        if pretty
+        {
+            serde_json::to_writer_pretty(&mut writer, &report)?;
+        }
+        else
+        {
+            serde_json::to_writer(&mut writer, &report)?;
+        }
+        writer.flush()?;
+        Ok(())
+    }
+
     fn write_execution_report(
         &self,
         path: impl AsRef<std::path::Path>,
         pretty: bool,
     ) -> Result<(), Box<dyn std::error::Error>>
     {
-        if !self.verify_system_is_init()
-        {
-            return Err("System is not initialized".into());
-        }
         let file = std::fs::File::create(path)?;
-        let writer = std::io::BufWriter::new(file);
-        let report = self.execution_report();
-        if pretty
-        {
-            serde_json::to_writer_pretty(writer, &report)?;
-        }
-        else
-        {
-            serde_json::to_writer(writer, &report)?;
-        }
-        Ok(())
+        self.write_execution_json(std::io::BufWriter::new(file), pretty)
     }
 
     pub fn export_execution_json(&self, path: impl AsRef<std::path::Path>) -> Result<(), Box<dyn std::error::Error>>
@@ -1600,6 +1613,59 @@ pub fn parser<'a>(system: &mut System<'a>, lines: Vec<&'a str>) -> Result<(), St
     system.add_rules(rules);
     system.rewrite_history = history;
     Ok(())
+}
+
+/// Serde asks for one element at a time. Every QueryExecution and its
+/// EvaluationCtx are dropped after serialization, bounding peak memory to
+/// one query instead of the entire set (including the 26-query big_test).
+struct StreamingExecutionReport<'s, 'a>
+{
+    system: &'s System<'a>,
+}
+
+struct StreamingQueries<'s, 'a>
+{
+    system: &'s System<'a>,
+}
+
+impl Serialize for StreamingQueries<'_, '_>
+{
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut seq = serializer.serialize_seq(Some(self.system.query.len()))?;
+        for &symbol in &self.system.query
+        {
+            let query = self.system.evaluate_traced(symbol);
+            seq.serialize_element(&query)?;
+            // The query, its trace, and its graph are freed here.
+        }
+        seq.end()
+    }
+}
+
+impl Serialize for StreamingExecutionReport<'_, '_>
+{
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut report = serializer.serialize_struct("ExecutionReport", 5)?;
+        report.serialize_field("schema_version", &2_u32)?;
+        report.serialize_field("initial_facts", &self.system.facts)?;
+        report.serialize_field("rewrite", &self.system.rewrite_history)?;
+        // Rewriting metadata is shared once rather than repeated per query.
+        let rewrite_graph = crate::report::ReasoningGraph::from_rewrite(
+            &self.system.rewrite_history,
+        );
+        report.serialize_field("rewrite_graph", &rewrite_graph)?;
+        report.serialize_field(
+            "queries",
+            &StreamingQueries { system: self.system },
+        )?;
+        report.end()
+    }
 }
 
 impl From<FactState> for crate::trace::LogicValue
