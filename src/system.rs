@@ -729,7 +729,15 @@ impl<'a> System<'a>
             (state, evidence)
         };
 
-        if eval_ctx.trace.is_some()
+        if eval_ctx.trace.as_ref().is_some_and(|trace| trace.is_full())
+        {
+            // No more trace events may be stored. Avoid allocating
+            // formatted AST strings and event-cause vectors repeatedly
+            // during the remaining (potentially expensive) inference.
+            eval_ctx.trace.as_mut().unwrap().truncated = true;
+            eval_ctx.last_evidence.clear();
+        }
+        else if eval_ctx.trace.is_some()
         {
             let observed = evidence.observed();
             // The event retains both signs for inspection, but only evidence
