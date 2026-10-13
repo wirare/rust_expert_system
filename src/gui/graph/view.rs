@@ -598,7 +598,7 @@ mod tests
     {
         assert_eq!(wrap_lines("A => B", 30, 2), "A => B");
         let long = wrap_lines(
-            "A + B + C + D + E + F + G => H", 15, 2,
+            "A + B + C + D + E + F + G + H + I + J => K + L", 15, 2,
         );
         assert!(long.lines().count() <= 2);
         assert!(long.contains('…'));
