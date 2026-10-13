@@ -308,9 +308,10 @@ mod tests
 
         let run = run_source(include_str!("../../../big_test.txt"), SolveMode::Sequential)
             .unwrap();
-        let query = run.execution.queries.iter()
-            .find(|query| query.symbol == 'E').unwrap();
-        let graph = ExplanationGraph::new(&run.execution, query);
+        let report = run.report.load_query(4).unwrap();
+        let query = &report.queries[0];
+        assert_eq!(query.symbol, 'E');
+        let graph = ExplanationGraph::new(&report, query);
         let layout = GraphLayout::new(&graph);
         let rectangles: HashMap<_, _> = layout.nodes.iter().map(|position|
         {
