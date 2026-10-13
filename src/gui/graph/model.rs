@@ -763,6 +763,58 @@ mod tests
     }
 
     #[test]
+    fn rule_labels_drop_only_the_outermost_pair_of_parentheses()
+    {
+        assert_eq!(
+            rule_display_expression("(A => (!B | !C))"),
+            "A => (!B | !C)",
+        );
+        assert_eq!(
+            rule_display_expression("((A + B) => (C | D))"),
+            "(A + B) => (C | D)",
+        );
+        assert_eq!(rule_display_expression("(A => B)"), "A => B");
+        assert_eq!(
+            rule_display_expression("(A) | (B)"),
+            "(A) | (B)",
+        );
+        assert_eq!(rule_display_expression("A => (!B | !C)"), "A => (!B | !C)");
+    }
+
+    #[test]
+    fn contradictory_initial_fact_still_supports_its_positive_rule()
+    {
+        let run = run_source("C=>B\nD=>!C\n=CD\n?B", SolveMode::Sequential)
+            .unwrap();
+        let query = &run.execution.queries[0];
+        assert!(matches!(query.outcome, QueryOutcome::Value(LogicValue::True)));
+        assert_eq!(observed_symbol_status(query, 'C'), LogicValue::Contradiction);
+
+        let graph = ExplanationGraph::new(&run.execution, query);
+        let c = graph.nodes.iter().find(|node|
+            node.kind == NodeKind::Fact
+                && node.literal == Some(Literal { symbol: 'C', positive: true })
+        ).expect("C used as a positive initial fact");
+
+        assert_eq!(c.observed_status, Some(LogicValue::Contradiction));
+        assert!(c.subtitle.contains("Used as TRUE here"));
+        assert!(c.subtitle.contains("both C and !C are proven"));
+
+        let rule = graph.nodes.iter().find(|node|
+            node.kind == NodeKind::Rule && node.title == "C => B"
+        ).expect("normalized rule with no outer grouping pair");
+
+        assert!(graph.links.iter().any(|link|
+            link.from == c.id && link.to == rule.id
+                && link.kind == LinkKind::Premise
+        ));
+
+        // The stored normalized rule is not mutated for display.
+        assert!(run.execution.rewrite.normalized_rules.iter()
+            .any(|rule| rule.expression == "(C => B)"));
+    }
+
+    #[test]
     fn proof_shows_premise_rule_conclusion_and_answer()
     {
         let graph = explanation("A=>B\n=A\n?B");
@@ -836,6 +888,13 @@ mod tests
         assert_eq!(query.symbol, 'V');
         assert!(conflicting_symbols(query).contains(&'R'),
             "C=>!R conflicts with enabled R");
+        assert_eq!(observed_symbol_status(query, 'C'), LogicValue::Contradiction);
+        let c_fact = graph.nodes.iter().find(|node|
+            node.kind == NodeKind::Fact
+                && node.literal == Some(Literal { symbol: 'C', positive: true })
+        ).expect("C initial fact supports this proof");
+        assert_eq!(c_fact.observed_status, Some(LogicValue::Contradiction));
+        assert!(c_fact.subtitle.contains("Used as TRUE here"));
 
         // If this rule is present in the displayed proof, its incoming
         // premises must be *positive* R or T, never !R or !T.
