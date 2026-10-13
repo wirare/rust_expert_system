@@ -289,7 +289,8 @@ fn draw_card(
     let left = rect.left() + 14.0 * zoom;
     let top = rect.top() + 10.0 * zoom;
 
-    painter.text(
+    let inside = painter.with_clip_rect(rect.shrink(9.0 * zoom));
+    inside.text(
         egui::pos2(left, top),
         egui::Align2::LEFT_TOP,
         node.kind.name(),
@@ -297,21 +298,36 @@ fn draw_card(
         egui::Color32::from_rgb(219, 231, 238),
     );
 
-    painter.text(
+    // Text layouts use the font's real pixel metrics, not only character
+    // counts. Separate clip regions guarantee that a long expression cannot
+    // overflow the node or overwrite the subtitle.
+    let text_width = (rect.width() - 30.0 * zoom).max(20.0);
+    let title_bounds = egui::Rect::from_min_size(
         egui::pos2(left, top + 23.0 * zoom),
-        egui::Align2::LEFT_TOP,
-        wrap_lines(&node.title, 32, 2),
+        egui::vec2(text_width, 51.0 * zoom),
+    );
+    let title_painter = inside.with_clip_rect(title_bounds);
+    let title = title_painter.layout(
+        wrap_lines(&node.title, 30, 2),
         egui::FontId::proportional(16.0 * zoom),
         egui::Color32::WHITE,
+        title_bounds.width(),
     );
+    title_painter.galley(title_bounds.min, title, egui::Color32::WHITE);
 
-    painter.text(
-        egui::pos2(left, top + 89.0 * zoom),
-        egui::Align2::LEFT_TOP,
-        wrap_lines(&node.subtitle, 44, 2),
-        egui::FontId::proportional(11.0 * zoom),
-        egui::Color32::from_rgb(224, 230, 234),
+    let subtitle_bounds = egui::Rect::from_min_size(
+        egui::pos2(left, top + 88.0 * zoom),
+        egui::vec2(text_width, 30.0 * zoom),
     );
+    let subtitle_painter = inside.with_clip_rect(subtitle_bounds);
+    let subtitle_color = egui::Color32::from_rgb(224, 230, 234);
+    let subtitle = subtitle_painter.layout(
+        wrap_lines(&node.subtitle, 40, 2),
+        egui::FontId::proportional(11.0 * zoom),
+        subtitle_color,
+        subtitle_bounds.width(),
+    );
+    subtitle_painter.galley(subtitle_bounds.min, subtitle, subtitle_color);
 }
 
 fn canvas(
