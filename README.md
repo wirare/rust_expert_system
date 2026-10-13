@@ -105,10 +105,13 @@ to the JSON array and dropped before evaluating the next query. The output
 remains a single valid `ExecutionReport` JSON file with schema version 2.
 
 The GUI uses this same serializer to create a unique temporary JSON file
-in the operating system's temporary directory. It then uses a **streaming JSON
-reader** to load only the selected query when displaying a graph; the other
-queries are skipped without allocating their traces. The temporary report
-is automatically deleted when replaced or when the application exits.
+in its per-user disk cache (`$XDG_CACHE_HOME/rust-expert-system`, normally
+`~/.cache/rust-expert-system`; the platform's local app-data directory on
+Windows). This avoids depending on `/tmp`, which can be RAM-backed. The GUI
+uses a **streaming JSON reader** to load only the selected query when
+displaying a graph; the others are skipped without allocating their traces.
+The temporary report is automatically deleted when replaced or when the
+application exits normally.
 Running in parallel remains available for the normal inference results;
 the report pass is deliberately serialized to bound memory.
 
