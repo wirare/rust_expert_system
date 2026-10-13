@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use eframe::egui;
 
 use crate::report::ExecutionReport;
+use crate::trace::LogicValue;
 
 use super::details;
 use super::layout::{GraphLayout, NODE_HEIGHT, NODE_WIDTH};
@@ -219,6 +220,17 @@ fn draw_arrow(
     // hid arrows and even obscured text inside nearby cards.
 }
 
+/// Keep both signs visibly marked without suggesting the opposite sign
+/// invalidates the particular proof used by this card.
+fn contradiction_badge(node: &super::model::ExplanationNode) -> Option<String>
+{
+    if node.observed_status != Some(LogicValue::Contradiction)
+    {
+        return None;
+    }
+    node.literal.map(|lit| format!("{} & !{} PROVEN", lit.symbol, lit.symbol))
+}
+
 fn draw_card(
     painter: &egui::Painter,
     rect: egui::Rect,
@@ -257,6 +269,28 @@ fn draw_card(
         egui::FontId::proportional(10.5 * zoom),
         egui::Color32::from_rgb(219, 231, 238),
     );
+
+    if let Some(badge_text) = contradiction_badge(node)
+    {
+        // Separate the *observed state* from the positive/negative proof
+        // actually used in this edge of the reasoning graph.
+        let badge_rect = egui::Rect::from_min_size(
+            egui::pos2(rect.right() - 135.0 * zoom, top - 2.0 * zoom),
+            egui::vec2(123.0 * zoom, 20.0 * zoom),
+        );
+        inside.rect_filled(
+            badge_rect,
+            4.0 * zoom,
+            egui::Color32::from_rgb(164, 91, 35),
+        );
+        inside.text(
+            badge_rect.center(),
+            egui::Align2::CENTER_CENTER,
+            badge_text,
+            egui::FontId::proportional(10.0 * zoom),
+            egui::Color32::WHITE,
+        );
+    }
 
     // Text layouts use the font's real pixel metrics, not only character
     // counts. Separate clip regions guarantee that a long expression cannot
@@ -419,6 +453,12 @@ fn legend(ui: &mut egui::Ui)
             ui.colored_label(fill(kind), "●");
             ui.small(kind.name());
         }
+        ui.separator();
+        ui.colored_label(
+            egui::Color32::from_rgb(245, 183, 81),
+            "C & !C PROVEN",
+        );
+        ui.small("Both signs exist; selected proof still applies");
     });
 }
 
@@ -588,6 +628,30 @@ mod tests
         assert!(long.contains('…'));
         assert!(wrap_lines("Réécriture extrêmement longue", 12, 2)
             .lines().count() <= 2);
+    }
+
+    #[test]
+    fn contradictory_literal_has_a_visible_badge()
+    {
+        let node = super::super::model::ExplanationNode
+        {
+            id: 1,
+            kind: NodeKind::Fact,
+            title: "C established".to_owned(),
+            subtitle: "Used as TRUE here".to_owned(),
+            event_id: Some(1),
+            rule_id: None,
+            literal: Some(crate::trace::Literal {
+                symbol: 'C',
+                positive: true,
+            }),
+            observed_status: Some(LogicValue::Contradiction),
+        };
+        assert_eq!(contradiction_badge(&node), Some("C & !C PROVEN".to_owned()));
+
+        let mut ordinary = node;
+        ordinary.observed_status = Some(LogicValue::True);
+        assert_eq!(contradiction_badge(&ordinary), None);
     }
 
     #[test]
