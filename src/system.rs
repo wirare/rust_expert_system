@@ -1,3 +1,6 @@
+use serde::ser::{SerializeSeq, SerializeStruct};
+use serde::{Serialize, Serializer};
+
 use crate::grammar;
 use crate::tokenizer::{Token, TokenType};
 use crate::ast::{ASTNode, build_ast, rpn, rewrite_with_history};
@@ -24,6 +27,11 @@ struct EvaluationCtx
     constraint_activation: Vec<Option<EventId>>,
     last_evidence: Vec<EventId>,
     constraint_last_evaluation: Vec<Option<EventId>>,
+    /// Failed proof searches that did not encounter cycles can be reused
+    /// until new facts or constraints change the knowledge state.
+    failed_search_at: [Option<u64>; 52],
+    knowledge_revision: u64,
+    cycle_count: u64,
 }
 
 #[derive(Debug)]
@@ -74,13 +82,54 @@ enum ConstraintState
     Contradiction,
 }
 
-#[derive(PartialEq, Eq)]
+#[derive(PartialEq, Eq, Clone, Copy)]
 enum Operation
 {
     And,
     Or,
     Not,
     Xor,
+}
+
+/// Signed causal evidence for the most recently evaluated expression.
+///
+/// Truth and falsity must remain separate: a contradictory literal can have
+/// valid positive support without its negative proof justifying the same rule.
+/// Empty vectors are also valid (e.g. negation-as-failure / default false).
+#[derive(Debug, Default, Clone)]
+struct ExpressionEvidence
+{
+    positive: Vec<EventId>,
+    negative: Vec<EventId>,
+}
+
+impl ExpressionEvidence
+{
+    fn combine(a: &[EventId], b: &[EventId]) -> Vec<EventId>
+    {
+        let mut result = a.to_vec();
+        result.extend_from_slice(b);
+        result.sort_unstable();
+        result.dedup();
+        result
+    }
+
+    fn observed(&self) -> Vec<EventId>
+    {
+        Self::combine(&self.positive, &self.negative)
+    }
+
+    /// This is a witness for applying a rule, even when the result also has
+    /// negative support. Conflicting evidence is preserved in 'observed'.
+    fn premise_support(&self, state: FactState) -> Vec<EventId>
+    {
+        match state
+        {
+            FactState::True | FactState::Contradiction => self.positive.clone(),
+            FactState::False => self.negative.clone(),
+            FactState::Undetermined => Vec::new(),
+        }
+    }
 }
 
 impl ProofState
@@ -141,6 +190,9 @@ impl EvaluationCtx
             constraint_activation: Vec::new(),
             last_evidence: Vec::new(),
             constraint_last_evaluation: Vec::new(),
+            failed_search_at: [None; 52],
+            knowledge_revision: 0,
+            cycle_count: 0,
         }
     }
 }
@@ -290,6 +342,12 @@ impl<'a> System<'a>
             return false;
         }
         
+        // A newly active constraint may make previously unreachable
+        // deductions possible, so cached negative searches are invalidated.
+        if eval_ctx.constraints[rule_idx].is_none()
+        {
+            eval_ctx.knowledge_revision = eval_ctx.knowledge_revision.wrapping_add(1);
+        }
         eval_ctx.constraints[rule_idx] = Some(set);
         true
     }
@@ -374,6 +432,7 @@ impl<'a> System<'a>
             _ => unreachable!(),
         }
 
+        eval_ctx.knowledge_revision = eval_ctx.knowledge_revision.wrapping_add(1);
         let literal = Literal { symbol, positive: target == FactState::True };
         let event = Self::emit(eval_ctx, TraceEventKind::LiteralProven { literal, origin }, causes);
         if let Some(id) = event
@@ -387,7 +446,7 @@ impl<'a> System<'a>
     fn emit(ctx: &mut EvaluationCtx, kind: TraceEventKind, causes: Vec<EventId>) -> Option<EventId>
     {
         let attempt_id = ctx.attempt_stack.last().copied();
-        ctx.trace.as_mut().map(|trace| trace.record(attempt_id, kind, causes))
+        ctx.trace.as_mut().and_then(|trace| trace.record(attempt_id, kind, causes))
     }
 
     fn mark_from_rule(ctx: &mut EvaluationCtx, symbol: char, state: FactState, rule_id: usize, causes: Vec<EventId>) -> bool
@@ -426,64 +485,122 @@ impl<'a> System<'a>
         Self::mark_proven(ctx, symbol, state, ProofOrigin::UnitPropagation { constraint_id }, causes)
     }
 
+    /// Belnap-style signed support: True supports truth, False supports
+    /// falsity, Contradiction supports both, Undetermined supports neither.
+    fn state_bits(state: FactState) -> (bool, bool)
+    {
+        match state
+        {
+            FactState::True => (true, false),
+            FactState::False => (false, true),
+            FactState::Contradiction => (true, true),
+            FactState::Undetermined => (false, false),
+        }
+    }
+
+    fn from_bits(positive: bool, negative: bool) -> FactState
+    {
+        match (positive, negative)
+        {
+            (true, true) => FactState::Contradiction,
+            (true, false) => FactState::True,
+            (false, true) => FactState::False,
+            (false, false) => FactState::Undetermined,
+        }
+    }
+
+    /// Apply operators to truth/falsity support separately, rather than
+    /// propagating Contradiction unconditionally from any subexpression.
     fn do_operation(op: Operation, lhs: FactState, rhs: Option<FactState>) -> FactState
     {
-        if lhs == FactState::Contradiction
-        {
-            return FactState::Contradiction;
-        }
+        let (lp, ln) = Self::state_bits(lhs);
+        let (rp, rn) = rhs.map(Self::state_bits).unwrap_or((false, false));
 
-        if rhs == Some(FactState::Contradiction)
+        let (positive, negative) = match op
         {
-            return FactState::Contradiction;
-        }
+            Operation::Not => (ln, lp),
+            Operation::And => (lp && rp, ln || rn),
+            Operation::Or => (lp || rp, ln && rn),
+            Operation::Xor =>
+            {
+                ((lp && rn) || (ln && rp), (lp && rp) || (ln && rn))
+            }
+        };
+
+        Self::from_bits(positive, negative)
+    }
+
+    /// Construct a *witness* for each truth polarity. For OR only one true
+    /// operand is necessary; for AND all true operands are necessary. A rule
+    /// premise never depends on evidence supporting its opposite polarity.
+    fn operation_evidence(
+        op: Operation,
+        lhs: FactState,
+        left: ExpressionEvidence,
+        rhs: Option<(FactState, ExpressionEvidence)>,
+    ) -> ExpressionEvidence
+    {
+        let (lp, ln) = Self::state_bits(lhs);
+        let (rp, rn) = rhs.as_ref()
+            .map(|(state, _)| Self::state_bits(*state))
+            .unwrap_or((false, false));
+        let right = rhs.map(|(_, evidence)| evidence).unwrap_or_default();
 
         match op
         {
-            Operation::Not =>
-            {
-                match lhs
-                {
-                    FactState::True             => FactState::False,
-                    FactState::False            => FactState::True,
-                    FactState::Undetermined     => FactState::Undetermined,
-                    FactState::Contradiction    => unreachable!(),
-                }
-            }
+            Operation::Not => ExpressionEvidence {
+                positive: left.negative,
+                negative: left.positive,
+            },
 
-            Operation::And =>
-            {
-                let rhs = rhs.expect("Binary operation requires rhs");
-                match (lhs, rhs)
+            Operation::And => ExpressionEvidence {
+                positive: if lp && rp
                 {
-                    (FactState::False, _) | (_, FactState::False)   => FactState::False,
-                    (FactState::True, FactState::True)              => FactState::True,
-                    _                                               => FactState::Undetermined,
+                    ExpressionEvidence::combine(&left.positive, &right.positive)
                 }
-            }
+                else { Vec::new() },
+                negative: if ln
+                {
+                    left.negative
+                }
+                else if rn { right.negative }
+                else { Vec::new() },
+            },
 
-            Operation::Or =>
-            {
-                let rhs = rhs.expect("Binary operation requires rhs");
-                match (lhs, rhs)
+            Operation::Or => ExpressionEvidence {
+                positive: if lp
                 {
-                    (FactState::True, _) | (_, FactState::True) => FactState::True,
-                    (FactState::False, FactState::False)        => FactState::False,
-                    _                                           => FactState::Undetermined,
+                    left.positive
                 }
-            }
+                else if rp { right.positive }
+                else { Vec::new() },
+                negative: if ln && rn
+                {
+                    ExpressionEvidence::combine(&left.negative, &right.negative)
+                }
+                else { Vec::new() },
+            },
 
-            Operation::Xor =>
-            {
-                let rhs = rhs.expect("Binary operation requires rhs");
-                match (lhs, rhs)
+            Operation::Xor => ExpressionEvidence {
+                positive: if lp && rn
                 {
-                    (FactState::Undetermined, _)        | (_, FactState::Undetermined)          => FactState::Undetermined,
-                    (FactState::True, FactState::False) | (FactState::False, FactState::True)   => FactState::True,
-                    (FactState::True, FactState::True)  | (FactState::False, FactState::False)  => FactState::False,
-                    _                                                                           => unreachable!(),
+                    ExpressionEvidence::combine(&left.positive, &right.negative)
                 }
-            }
+                else if ln && rp
+                {
+                    ExpressionEvidence::combine(&left.negative, &right.positive)
+                }
+                else { Vec::new() },
+                negative: if lp && rp
+                {
+                    ExpressionEvidence::combine(&left.positive, &right.positive)
+                }
+                else if ln && rn
+                {
+                    ExpressionEvidence::combine(&left.negative, &right.negative)
+                }
+                else { Vec::new() },
+            },
         }
     }
 
@@ -569,48 +686,79 @@ impl<'a> System<'a>
             })
     }
 
-    fn evaluate_expression_from_ast(&self, eval_ctx: &mut EvaluationCtx, exp: &ASTNode) -> Result<FactState, String>
+    fn evaluate_expression_from_ast(
+        &self,
+        eval_ctx: &mut EvaluationCtx,
+        exp: &ASTNode,
+    ) -> Result<FactState, String>
     {
-        let mut causes = Vec::new();
-        let result = if exp.token.is_operator()
+        self.evaluate_expression_with_evidence(eval_ctx, exp).map(|(state, _)| state)
+    }
+
+    fn evaluate_expression_with_evidence(
+        &self,
+        eval_ctx: &mut EvaluationCtx,
+        exp: &ASTNode,
+    ) -> Result<(FactState, ExpressionEvidence), String>
+    {
+        let (result, evidence) = if exp.token.is_operator()
         {
-            let lhs = self.evaluate_expression_from_ast(eval_ctx, exp.left.as_deref().unwrap())?;
-            causes.extend(eval_ctx.last_evidence.iter().copied());
-            let rhs = if exp.token.token_type != TokenType::Not
+            let (lhs, lhs_evidence) = self.evaluate_expression_with_evidence(
+                eval_ctx, exp.left.as_deref().unwrap(),
+            )?;
+            let op: Operation = exp.token.token_type.into();
+
+            let rhs = if op != Operation::Not
             {
-                let rhs = self.evaluate_expression_from_ast(eval_ctx, exp.right.as_deref().unwrap())?;
-                causes.extend(eval_ctx.last_evidence.iter().copied());
-                Some(rhs)
+                Some(self.evaluate_expression_with_evidence(
+                    eval_ctx, exp.right.as_deref().unwrap(),
+                )?)
             }
             else { None };
-            System::do_operation(exp.token.token_type.into(), lhs, rhs)
+
+            let result = Self::do_operation(op, lhs, rhs.as_ref().map(|(s, _)| *s));
+            let evidence = Self::operation_evidence(op, lhs, lhs_evidence, rhs);
+            (result, evidence)
         }
         else
         {
             let symbol = exp.token.value.chars().next().unwrap();
             let state = self.evaluate_symbol(eval_ctx, symbol)?;
-            let index = symbol_to_nb(symbol) * 2;
-            if eval_ctx.symbols_state[symbol_to_nb(symbol)].positive
-            {
-                causes.extend(eval_ctx.proof_events[index]);
-            }
-            if eval_ctx.symbols_state[symbol_to_nb(symbol)].negative
-            {
-                causes.extend(eval_ctx.proof_events[index + 1]);
-            }
-            state
+            let base = symbol_to_nb(symbol) * 2;
+            let evidence = ExpressionEvidence {
+                positive: eval_ctx.proof_events[base].into_iter().collect(),
+                negative: eval_ctx.proof_events[base + 1].into_iter().collect(),
+            };
+            (state, evidence)
         };
-        causes.sort_unstable();
-        causes.dedup();
-        if eval_ctx.trace.is_some()
+
+        if eval_ctx.trace.as_ref().is_some_and(|trace| trace.is_full())
         {
-            let expression = crate::ast::format_ast(exp);
-            let event = Self::emit(eval_ctx, TraceEventKind::ExpressionEvaluated {
-                expression, result: result.into(), operand_events: causes.clone(),
-            }, causes);
+            // No more trace events may be stored. Avoid allocating
+            // formatted AST strings and event-cause vectors repeatedly
+            // during the remaining (potentially expensive) inference.
+            eval_ctx.trace.as_mut().unwrap().truncated = true;
+            eval_ctx.last_evidence.clear();
+        }
+        else if eval_ctx.trace.is_some()
+        {
+            let observed = evidence.observed();
+            // The event retains both signs for inspection, but only evidence
+            // supporting the evaluated polarity is followed by proof graphs.
+            let supporting = evidence.premise_support(result);
+            let event = Self::emit(
+                eval_ctx,
+                TraceEventKind::ExpressionEvaluated {
+                    expression: crate::ast::format_ast(exp),
+                    result: result.into(),
+                    operand_events: observed,
+                },
+                supporting,
+            );
             eval_ctx.last_evidence = event.into_iter().collect();
         }
-        Ok(result)
+
+        Ok((result, evidence))
     }
 
     fn evaluate_expression_from_idx(&self, eval_ctx: &mut EvaluationCtx, rule_idx: usize) -> Result<FactState, String>
@@ -766,11 +914,20 @@ impl<'a> System<'a>
             return Ok(true);
         }
 
+        let memo_slot = index * 2 + usize::from(target_state == FactState::False);
+        if eval_ctx.failed_search_at[memo_slot] == Some(eval_ctx.knowledge_revision)
+        {
+            return Ok(false);
+        }
+
         let visiting_key = (symbol, target_state);
         let literal = Literal { symbol, positive: target_state == FactState::True };
 
         if eval_ctx.visiting.contains(&visiting_key)
         {
+            // A failed search that encountered an active recursion cycle is
+            // context-dependent and must not be memoized.
+            eval_ctx.cycle_count = eval_ctx.cycle_count.wrapping_add(1);
             if let Some(&previous_attempt) = eval_ctx.active_attempts.get(&visiting_key)
             {
                 let cycle = Self::emit(eval_ctx, TraceEventKind::CycleDetected { goal: literal, previous_attempt }, vec![]);
@@ -807,6 +964,8 @@ impl<'a> System<'a>
         }
 
         eval_ctx.visiting.insert(visiting_key);
+        let revision_on_entry = eval_ctx.knowledge_revision;
+        let cycles_on_entry = eval_ctx.cycle_count;
 
         let result = (|| -> Result<bool, String>
             {
@@ -949,6 +1108,14 @@ impl<'a> System<'a>
             })();
 
         eval_ctx.visiting.remove(&visiting_key);
+        if matches!(result, Ok(false))
+            && eval_ctx.knowledge_revision == revision_on_entry
+            && eval_ctx.cycle_count == cycles_on_entry
+        {
+            // Fixed-point negative caching: valid only with unchanged
+            // knowledge and without any recursive cycle in this search.
+            eval_ctx.failed_search_at[memo_slot] = Some(revision_on_entry);
+        }
         if let Some(attempt_id) = attempt_id
         {
             let outcome = match &result
@@ -1164,7 +1331,19 @@ impl<'a> System<'a>
             Err(message) => QueryOutcome::Error { message },
         };
         let trace = ctx.trace.take().unwrap();
-        let graph = crate::report::ReasoningGraph::from_trace(&trace);
+        // A truncated trace is not a complete proof. Do not synthesize a
+        // misleading graph from its partial prefix.
+        let graph = if trace.truncated
+        {
+            crate::report::ReasoningGraph {
+                nodes: Vec::new(),
+                edges: Vec::new(),
+            }
+        }
+        else
+        {
+            crate::report::ReasoningGraph::from_trace(&trace)
+        };
         QueryExecution { symbol, outcome, trace, graph }
     }
 
@@ -1179,28 +1358,38 @@ impl<'a> System<'a>
         }
     }
 
+    /// Serialize query-by-query rather than retaining every query's trace.
+    /// The output is the same ExecutionReport JSON schema as before.
+    pub fn write_execution_json<W: std::io::Write>(
+        &self,
+        mut writer: W,
+        pretty: bool,
+    ) -> Result<(), Box<dyn std::error::Error>>
+    {
+        self.validate_ready()
+            .map_err(std::io::Error::other)?;
+
+        let report = StreamingExecutionReport { system: self };
+        if pretty
+        {
+            serde_json::to_writer_pretty(&mut writer, &report)?;
+        }
+        else
+        {
+            serde_json::to_writer(&mut writer, &report)?;
+        }
+        writer.flush()?;
+        Ok(())
+    }
+
     fn write_execution_report(
         &self,
         path: impl AsRef<std::path::Path>,
         pretty: bool,
     ) -> Result<(), Box<dyn std::error::Error>>
     {
-        if !self.verify_system_is_init()
-        {
-            return Err("System is not initialized".into());
-        }
         let file = std::fs::File::create(path)?;
-        let writer = std::io::BufWriter::new(file);
-        let report = self.execution_report();
-        if pretty
-        {
-            serde_json::to_writer_pretty(writer, &report)?;
-        }
-        else
-        {
-            serde_json::to_writer(writer, &report)?;
-        }
-        Ok(())
+        self.write_execution_json(std::io::BufWriter::new(file), pretty)
     }
 
     pub fn export_execution_json(&self, path: impl AsRef<std::path::Path>) -> Result<(), Box<dyn std::error::Error>>
@@ -1426,6 +1615,59 @@ pub fn parser<'a>(system: &mut System<'a>, lines: Vec<&'a str>) -> Result<(), St
     Ok(())
 }
 
+/// Serde asks for one element at a time. Every QueryExecution and its
+/// EvaluationCtx are dropped after serialization, bounding peak memory to
+/// one query instead of the entire set (including the 26-query big_test).
+struct StreamingExecutionReport<'s, 'a>
+{
+    system: &'s System<'a>,
+}
+
+struct StreamingQueries<'s, 'a>
+{
+    system: &'s System<'a>,
+}
+
+impl Serialize for StreamingQueries<'_, '_>
+{
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut seq = serializer.serialize_seq(Some(self.system.query.len()))?;
+        for &symbol in &self.system.query
+        {
+            let query = self.system.evaluate_traced(symbol);
+            seq.serialize_element(&query)?;
+            // The query, its trace, and its graph are freed here.
+        }
+        seq.end()
+    }
+}
+
+impl Serialize for StreamingExecutionReport<'_, '_>
+{
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut report = serializer.serialize_struct("ExecutionReport", 5)?;
+        report.serialize_field("schema_version", &2_u32)?;
+        report.serialize_field("initial_facts", &self.system.facts)?;
+        report.serialize_field("rewrite", &self.system.rewrite_history)?;
+        // Rewriting metadata is shared once rather than repeated per query.
+        let rewrite_graph = crate::report::ReasoningGraph::from_rewrite(
+            &self.system.rewrite_history,
+        );
+        report.serialize_field("rewrite_graph", &rewrite_graph)?;
+        report.serialize_field(
+            "queries",
+            &StreamingQueries { system: self.system },
+        )?;
+        report.end()
+    }
+}
+
 impl From<FactState> for crate::trace::LogicValue
 {
     fn from(value: FactState) -> Self
@@ -1601,6 +1843,74 @@ mod inference_tests
         let mut recorded = last.causes.clone();
         recorded.sort_unstable();
         assert_eq!(recorded, evidence, "a contradiction needs both signed proofs");
+    }
+
+    #[test]
+    fn four_valued_operators_do_not_spread_contradictions_incorrectly()
+    {
+        // R and !R are established. They do not make R OR T false when
+        // T is true, and cannot make R AND T true when T is false.
+        assert_eq!(
+            System::do_operation(Operation::Or, FactState::Contradiction,
+                Some(FactState::True)),
+            FactState::True,
+        );
+        assert_eq!(
+            System::do_operation(Operation::And, FactState::Contradiction,
+                Some(FactState::False)),
+            FactState::False,
+        );
+        assert_eq!(
+            System::do_operation(Operation::Or, FactState::Contradiction,
+                Some(FactState::False)),
+            FactState::Contradiction,
+        );
+        assert_eq!(
+            System::do_operation(Operation::Not, FactState::Contradiction, None),
+            FactState::Contradiction,
+        );
+    }
+
+    #[test]
+    fn or_premise_uses_positive_witness_not_its_negative_proofs()
+    {
+        let source = "C=>!R\nD=>!T\nR|T=>!C\n=CDR\n?C";
+        let mut system = System::new();
+        parser(&mut system, source.lines().collect()).unwrap();
+        system.compute_rules_for_symbols();
+        let query = system.evaluate_traced('C');
+        assert!(matches!(query.outcome,
+            QueryOutcome::Value(crate::trace::LogicValue::Contradiction)));
+
+        let events = &query.trace.events;
+        let applied = events.iter().find(|event| matches!(&event.kind,
+            TraceEventKind::RuleApplied { rule_id }
+                if system.rewrite_history.normalized_rules[*rule_id].expression.contains("(R | T)")
+        )).expect("R | T implication was applied");
+        let premise = &events[applied.causes[0] as usize];
+        let expression = &events[premise.causes[0] as usize];
+        assert!(matches!(&expression.kind,
+            TraceEventKind::ExpressionEvaluated { expression, .. }
+                if expression.contains("(R | T)")
+        ));
+        let causal_literals = expression.causes.iter().filter_map(|&id|
+        {
+            if let TraceEventKind::LiteralProven { literal, .. } =
+                &events[id as usize].kind
+            {
+                Some(*literal)
+            }
+            else { None }
+        }).collect::<Vec<_>>();
+
+        assert_eq!(causal_literals,
+            vec![Literal { symbol:'R', positive:true }],
+            "Only positive R proves R | T; !R and !T are contrary evidence");
+        assert!(events.iter().any(|event|
+            matches!(&event.kind, TraceEventKind::LiteralProven {
+                literal: Literal { symbol:'R', positive:false }, ..
+            })
+        ), "Negative R proof is still recorded for contradiction inspection");
     }
 
     #[test]

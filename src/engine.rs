@@ -6,7 +6,7 @@
 use std::time::{Duration, Instant};
 
 use crate::system::{System, parser};
-use crate::report::{ExecutionReport, QueryOutcome};
+use crate::report_store::ReportStore;
 use crate::trace::LogicValue;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -32,9 +32,9 @@ pub struct RunReport
     pub parse_duration: Duration,
     pub solve_duration: Duration,
     pub total_duration: Duration,
-    /// Full traces, rewrite provenance, and graph data for all queries.
-    /// Produced after the selected sequential/parallel result calculation.
-    pub execution: ExecutionReport,
+    pub report_duration: Duration,
+    /// Disk-backed, per-query JSON trace. No full ExecutionReport is retained.
+    pub report: ReportStore,
 }
 
 /// Read the source's initial-facts declaration for frontend controls.
@@ -110,16 +110,22 @@ fn run_source_inner(
     };
     let solve_duration = solve_started.elapsed();
 
-    // Retain a fully owned report for the graph UI and future trace tools.
-    // Trace collection is query-local and intentionally independent from
-    // whether the primary solve ran sequentially or in parallel.
-    let execution = system.execution_report();
-    for ((symbol, value), query) in outputs.iter().zip(&execution.queries)
+    // Generate the exact same JSON format as the CLI, but directly onto
+    // disk. The writer evaluates/serializes/drops each query in turn, and
+    // the GUI later loads only the selected query with a streaming reader.
+    let report_started = Instant::now();
+    let report = ReportStore::generate(&system)?;
+
+    // Verify the new report is readable before displaying the completed run.
+    // This only materializes the first query, never the complete report.
+    if let Some((symbol, value)) = outputs.first()
     {
+        let selected = report.load_query(0)?;
+        let query = &selected.queries[0];
         let matching = match (value, &query.outcome)
         {
-            (Ok(left), QueryOutcome::Value(right)) => left == right,
-            (Err(left), QueryOutcome::Error { message }) => left == message,
+            (Ok(left), crate::report::QueryOutcome::Value(right)) => left == right,
+            (Err(left), crate::report::QueryOutcome::Error { message }) => left == message,
             _ => false,
         };
         if *symbol != query.symbol || !matching
@@ -129,6 +135,7 @@ fn run_source_inner(
             ));
         }
     }
+    let report_duration = report_started.elapsed();
 
     Ok(RunReport
     {
@@ -140,8 +147,9 @@ fn run_source_inner(
         }).collect(),
         parse_duration,
         solve_duration,
+        report_duration,
         total_duration: started.elapsed(),
-        execution,
+        report,
     })
 }
 
@@ -151,24 +159,49 @@ mod tests
     use super::*;
 
     #[test]
+    fn big_test_without_c_keeps_query_result_and_bounds_trace_memory()
+    {
+        // C disabled is the reported problematic fact configuration.
+        // Keep this focused on V so CI checks both correctness and trace
+        // bounds without re-running 26 large traced searches.
+        let source = include_str!("../big_test.txt")
+            .replace("=ABCD", "=ABD")
+            .replace("?ABCDEFGHIJKLMNOPQRSTUVWXYZ", "?V");
+
+        let report = run_source(&source, SolveMode::Sequential).unwrap();
+        assert_eq!(report.results[0].symbol, 'V');
+        assert_eq!(report.results[0].value, Ok(LogicValue::False));
+        let selected = report.report.load_query(0).unwrap();
+        assert_eq!(selected.queries.len(), 1);
+        let trace = &selected.queries[0].trace;
+        assert!(trace.events.len() <= crate::trace::MAX_TRACE_EVENTS_PER_QUERY);
+
+        if trace.truncated
+        {
+            assert!(selected.queries[0].graph.nodes.is_empty(),
+                "An incomplete trace must not claim to be a complete proof");
+        }
+    }
+
+    #[test]
     fn captures_graphs_for_each_query_and_rewrite_rules()
     {
         let source = "A=>B\n=A\n?AB";
         let run = run_source(source, SolveMode::Sequential).unwrap();
 
-        assert_eq!(run.execution.queries.len(), 2);
-        assert_eq!(run.execution.queries[0].symbol, 'A');
-        assert_eq!(run.execution.queries[1].symbol, 'B');
+        assert_eq!(run.results.len(), 2);
 
-        for (result, query) in run.results.iter().zip(&run.execution.queries)
+        for (index, result) in run.results.iter().enumerate()
         {
+            let selected = run.report.load_query(index).unwrap();
+            let query = &selected.queries[0];
             assert_eq!(result.symbol, query.symbol);
             assert!(!query.graph.nodes.is_empty());
             assert!(!query.trace.events.is_empty());
             assert_eq!(query.graph.nodes.iter().filter(|node|
                 matches!(node.kind, crate::report::GraphNodeKind::Query { .. })).count(), 1);
         }
-        assert_eq!(run.execution.rewrite.normalized_rules.len(), 1);
+        assert_eq!(run.report.load_query(0).unwrap().rewrite.normalized_rules.len(), 1);
     }
 
     #[test]
@@ -179,15 +212,16 @@ mod tests
         facts[0] = true;
         let enabled = run_source_with_facts(source, SolveMode::Parallel, facts).unwrap();
         assert_eq!(enabled.results[0].value, Ok(LogicValue::True));
-        assert!(enabled.execution.initial_facts.contains(&'A'));
+        assert!(enabled.report.load_query(0).unwrap().initial_facts.contains(&'A'));
 
         facts[0] = false;
         let disabled = run_source_with_facts(source, SolveMode::Parallel, facts).unwrap();
         assert_eq!(disabled.results[0].value, Ok(LogicValue::False));
-        assert!(!disabled.execution.initial_facts.contains(&'A'));
+        let selected = disabled.report.load_query(0).unwrap();
+        assert!(!selected.initial_facts.contains(&'A'));
         assert!(matches!(
-            disabled.execution.queries[0].outcome,
-            QueryOutcome::Value(LogicValue::False)
+            selected.queries[0].outcome,
+            crate::report::QueryOutcome::Value(LogicValue::False)
         ));
     }
 

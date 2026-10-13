@@ -5,6 +5,10 @@ pub type AttemptId = u64;
 pub type RuleId = usize;
 pub type ConstraintId = usize;
 
+/// Maximum retained events per query. The inference engine keeps running after
+/// this limit; only tracing stops. This bounds CLI and GUI report memory.
+pub const MAX_TRACE_EVENTS_PER_QUERY: usize = 100_000;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Literal
 {
@@ -37,6 +41,10 @@ pub struct EvaluationTrace
     pub events: Vec<TraceEvent>,
     #[serde(default)]
     pub attempts: u64,
+    /// True if recording stopped at the per-query memory budget. The solver
+    /// result remains complete, but no proof graph may be trusted afterward.
+    #[serde(default)]
+    pub truncated: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -167,13 +175,67 @@ impl EvaluationTrace
 {
     pub fn new(query: char) -> Self
     {
-        Self { query, events: Vec::new(), attempts: 0 }
+        Self { query, events: Vec::new(), attempts: 0, truncated: false }
     }
 
-    pub fn record(&mut self, attempt_id: Option<AttemptId>, kind: TraceEventKind, causes: Vec<EventId>) -> EventId
+    pub fn record(
+        &mut self,
+        attempt_id: Option<AttemptId>,
+        kind: TraceEventKind,
+        causes: Vec<EventId>,
+    ) -> Option<EventId>
     {
+        if self.events.len() >= MAX_TRACE_EVENTS_PER_QUERY
+        {
+            self.truncated = true;
+            return None;
+        }
         let id = self.events.len() as EventId;
         self.events.push(TraceEvent { id, attempt_id, kind, causes });
-        id
+        Some(id)
+    }
+
+    pub fn is_full(&self) -> bool
+    {
+        self.truncated || self.events.len() >= MAX_TRACE_EVENTS_PER_QUERY
+    }
+}
+
+#[cfg(test)]
+mod bounds_tests
+{
+    use super::*;
+
+    #[test]
+    fn bounded_trace_drops_excess_events_without_growing()
+    {
+        let mut trace = EvaluationTrace::new('V');
+        for index in 0..MAX_TRACE_EVENTS_PER_QUERY
+        {
+            assert_eq!(
+                trace.record(None, TraceEventKind::RuleConsidered { rule_id: index }, vec![]),
+                Some(index as u64),
+            );
+        }
+
+        assert!(!trace.truncated);
+        assert_eq!(trace.events.len(), MAX_TRACE_EVENTS_PER_QUERY);
+        assert!(trace.record(None, TraceEventKind::RuleConsidered {
+            rule_id: MAX_TRACE_EVENTS_PER_QUERY,
+        }, vec![]).is_none());
+        assert!(trace.truncated);
+
+        for _ in 0..100_000
+        {
+            assert!(trace.record(None, TraceEventKind::RuleConsidered {
+                rule_id: 0,
+            }, vec![]).is_none());
+        }
+        assert_eq!(trace.events.len(), MAX_TRACE_EVENTS_PER_QUERY);
+
+        let serialized = serde_json::to_string(&trace).unwrap();
+        let recovered: EvaluationTrace = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(recovered.events.len(), MAX_TRACE_EVENTS_PER_QUERY);
+        assert!(recovered.truncated);
     }
 }

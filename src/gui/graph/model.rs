@@ -1,0 +1,1093 @@
+//! Explanation-first projection of a chronological inference trace.
+//!
+//! The complete trace contains failed searches, cache hits, and repeated
+//! attempts. Drawing all of them makes an unreadable hairball. This module
+//! follows *only* causal evidence for the selected query, retaining the
+//! original event IDs so nothing is fabricated or disconnected from the engine.
+
+use std::collections::HashSet;
+
+use crate::report::{ExecutionReport, QueryExecution, QueryOutcome};
+use crate::trace::{
+    ConstraintOutcome, EventId, Literal, LogicValue, ProofOrigin, TraceEventKind,
+};
+
+pub type DisplayNodeId = u64;
+const QUERY_ID: DisplayNodeId = u64::MAX;
+const NOTE_ID: DisplayNodeId = u64::MAX - 1;
+const MAX_DISPLAY_NODES: usize = 280;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum NodeKind
+{
+    Answer,
+    Fact,
+    Rule,
+    Clause,
+    Derived,
+    Notice,
+}
+
+impl NodeKind
+{
+    pub fn name(self) -> &'static str
+    {
+        match self
+        {
+            Self::Answer => "ANSWER",
+            Self::Fact => "INITIAL FACT",
+            Self::Rule => "RULE APPLIED",
+            Self::Clause => "OR CONSTRAINT",
+            Self::Derived => "DEDUCTION",
+            Self::Notice => "NOT ESTABLISHED",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ExplanationNode
+{
+    pub id: DisplayNodeId,
+    pub kind: NodeKind,
+    pub title: String,
+    pub subtitle: String,
+    pub event_id: Option<EventId>,
+    pub rule_id: Option<usize>,
+    pub literal: Option<Literal>,
+    /// Signed support observed in this query, not global truth.
+    pub observed_status: Option<LogicValue>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum LinkKind
+{
+    Premise,
+    Activates,
+    Derives,
+    RulesOut,
+    Forces,
+    Supports,
+    Answer,
+    Unresolved,
+}
+
+impl LinkKind
+{
+    pub fn label(self) -> &'static str
+    {
+        match self
+        {
+            Self::Premise => "satisfies premise",
+            Self::Activates => "activates",
+            Self::Derives => "derives",
+            Self::RulesOut => "rules out an alternative",
+            Self::Forces => "forces",
+            Self::Supports => "supports",
+            Self::Answer => "establishes the answer",
+            Self::Unresolved => "remains ambiguous",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ExplanationLink
+{
+    pub from: DisplayNodeId,
+    pub to: DisplayNodeId,
+    pub kind: LinkKind,
+}
+
+#[derive(Debug, Default)]
+pub struct ExplanationGraph
+{
+    pub nodes: Vec<ExplanationNode>,
+    pub links: Vec<ExplanationLink>,
+    pub root: DisplayNodeId,
+    pub limited: bool,
+}
+
+impl ExplanationGraph
+{
+    pub fn node(&self, id: DisplayNodeId) -> Option<&ExplanationNode>
+    {
+        self.nodes.iter().find(|node| node.id == id)
+    }
+
+    pub fn new(report: &ExecutionReport, query: &QueryExecution) -> Self
+    {
+        let mut builder = Builder {
+            report,
+            query,
+            output: Self {
+                root: QUERY_ID,
+                ..Self::default()
+            },
+            existing: HashSet::new(),
+            links: HashSet::new(),
+            visited: HashSet::new(),
+        };
+
+        builder.add_node(ExplanationNode {
+            id: QUERY_ID,
+            kind: NodeKind::Answer,
+            title: format!("{} = {}", query.symbol, outcome_name(&query.outcome)),
+            subtitle: match &query.outcome
+            {
+                QueryOutcome::Value(LogicValue::Contradiction) =>
+                    "Positive and negative proofs both exist".into(),
+                QueryOutcome::Value(LogicValue::Undetermined) =>
+                    "An active disjunction remains unresolved".into(),
+                QueryOutcome::Value(LogicValue::False) =>
+                    "Explicit negation, or default false if unproven".into(),
+                QueryOutcome::Value(LogicValue::True) =>
+                    "Supported by recorded evidence".into(),
+                QueryOutcome::Error { .. } =>
+                    "The engine did not finish this query".into(),
+            },
+            event_id: None,
+            rule_id: None,
+            literal: None,
+            observed_status: None,
+        });
+
+        let final_event = query.trace.events.iter().rev().find(|event|
+        {
+            matches!(&event.kind,
+                TraceEventKind::QueryFinished { .. } | TraceEventKind::QueryFailed { .. })
+        });
+
+        if let Some(event) = final_event
+        {
+            for &cause in &event.causes
+            {
+                for source in builder.resolve(cause)
+                {
+                    builder.link(source, QUERY_ID, LinkKind::Answer);
+                }
+            }
+        }
+
+        let has_answer_evidence = builder.output.links.iter()
+            .any(|link| link.to == QUERY_ID && link.kind == LinkKind::Answer);
+
+        if !has_answer_evidence
+        {
+            builder.no_proof_context();
+        }
+
+        builder.output.nodes.sort_by_key(|node| node.id);
+        builder.output.links.sort_by_key(|link|
+        {
+            (link.from, link.to, link.kind as u8)
+        });
+        builder.output
+    }
+}
+
+pub fn literal_text(literal: Literal) -> String
+{
+    if literal.positive
+    {
+        literal.symbol.to_string()
+    }
+    else
+    {
+        format!("!{}", literal.symbol)
+    }
+}
+
+/// Remove a single outer grouping pair only when it encloses the whole
+/// rule, leaving all nested premise/conclusion parentheses intact.
+pub fn rule_display_expression(expression: &str) -> &str
+{
+    let expression = expression.trim();
+    if !expression.starts_with('(') || !expression.ends_with(')')
+    {
+        return expression;
+    }
+
+    let mut depth = 0_i32;
+    for (offset, ch) in expression.char_indices()
+    {
+        match ch
+        {
+            '(' => depth += 1,
+            ')' =>
+            {
+                depth -= 1;
+                if depth < 0 || (depth == 0 && offset + ch.len_utf8() < expression.len())
+                {
+                    return expression;
+                }
+            }
+            _ => {}
+        }
+    }
+    if depth == 0 { &expression[1..expression.len() - 1] }
+    else { expression }
+}
+
+/// States here are based on the proof events actually recorded for this query.
+/// In particular, False means !symbol was proved, not default false.
+pub fn observed_symbol_status(query: &QueryExecution, symbol: char) -> LogicValue
+{
+    let mut positive = false;
+    let mut negative = false;
+    for event in &query.trace.events
+    {
+        if let TraceEventKind::LiteralProven { literal, .. } = &event.kind
+        {
+            if literal.symbol == symbol
+            {
+                if literal.positive { positive = true; }
+                else { negative = true; }
+                if positive && negative { return LogicValue::Contradiction; }
+            }
+        }
+    }
+    match (positive, negative)
+    {
+        (true, false) => LogicValue::True,
+        (false, true) => LogicValue::False,
+        _ => LogicValue::Undetermined,
+    }
+}
+
+pub fn outcome_name(outcome: &QueryOutcome) -> &'static str
+{
+    match outcome
+    {
+        QueryOutcome::Value(LogicValue::True) => "TRUE",
+        QueryOutcome::Value(LogicValue::False) => "FALSE",
+        QueryOutcome::Value(LogicValue::Undetermined) => "UNDETERMINED",
+        QueryOutcome::Value(LogicValue::Contradiction) => "CONTRADICTION",
+        QueryOutcome::Error { .. } => "ERROR",
+    }
+}
+
+/// Contradictions observed while answering this query. They are shown as
+/// diagnostic warnings, not as causal proof edges for unrelated rules.
+pub fn conflicting_symbols(query: &QueryExecution) -> Vec<char>
+{
+    ('A'..='Z').filter(|symbol|
+    {
+        observed_symbol_status(query, *symbol) == LogicValue::Contradiction
+    }).collect()
+}
+
+struct Builder<'a>
+{
+    report: &'a ExecutionReport,
+    query: &'a QueryExecution,
+    output: ExplanationGraph,
+    existing: HashSet<DisplayNodeId>,
+    links: HashSet<(DisplayNodeId, DisplayNodeId, LinkKind)>,
+    visited: HashSet<EventId>,
+}
+
+impl Builder<'_>
+{
+    fn add_node(&mut self, node: ExplanationNode)
+    {
+        if self.existing.contains(&node.id)
+        {
+            return;
+        }
+        if self.output.nodes.len() >= MAX_DISPLAY_NODES
+        {
+            self.output.limited = true;
+            return;
+        }
+
+        self.existing.insert(node.id);
+        self.output.nodes.push(node);
+    }
+
+    fn link(&mut self, from: DisplayNodeId, to: DisplayNodeId, kind: LinkKind)
+    {
+        if from == to || !self.existing.contains(&from) || !self.existing.contains(&to)
+        {
+            return;
+        }
+        if self.links.insert((from, to, kind))
+        {
+            self.output.links.push(ExplanationLink { from, to, kind });
+        }
+    }
+
+    fn normalized_rule(&self, rule_id: usize) -> (String, String)
+    {
+        if let Some(rule) = self.report.rewrite.normalized_rules.iter()
+            .find(|rule| rule.id == rule_id)
+        {
+            let line = self.report.rewrite.original_rules.iter()
+                .find(|original| original.id == rule.original_rule_id)
+                .map(|original| format!("Input line {}", original.source_line))
+                .unwrap_or_else(|| "Normalized conclusion".into());
+            (rule_display_expression(&rule.expression).to_owned(), line)
+        }
+        else
+        {
+            (format!("Rule #{rule_id}"), "Normalized rule".into())
+        }
+    }
+
+    /// Returns the nearest visible predecessors for a trace event. Uninteresting
+    /// intermediate events (premise evaluation, AST operations, cached reuse)
+    /// are traversed but not rendered as standalone cards.
+    fn resolve(&mut self, event_id: EventId) -> Vec<DisplayNodeId>
+    {
+        if self.visited.contains(&event_id)
+        {
+            return if self.existing.contains(&event_id)
+            {
+                vec![event_id]
+            }
+            else
+            {
+                // Intermediate nodes may be shared. Their ancestors are
+                // recalculated to preserve all causal edges.
+                self.resolve_ancestors(event_id)
+            };
+        }
+        self.visited.insert(event_id);
+
+        let Some(event) = self.query.trace.events.get(event_id as usize) else
+        {
+            return Vec::new();
+        };
+        let kind = event.kind.clone();
+        let causes = event.causes.clone();
+
+        match kind
+        {
+            TraceEventKind::LiteralProven { literal, origin } =>
+            {
+                let forced_by_clause = matches!(&origin, ProofOrigin::UnitPropagation { .. });
+                let observed_status = observed_symbol_status(self.query, literal.symbol);
+                let (kind, subtitle, rule_id) = match &origin
+                {
+                    ProofOrigin::InitialFact =>
+                        (NodeKind::Fact, "Enabled initial fact".into(), None),
+                    ProofOrigin::Rule { rule_id } =>
+                        (NodeKind::Derived, format!("Directly inferred by rule #{rule_id}"), Some(*rule_id)),
+                    ProofOrigin::UnitPropagation { constraint_id } =>
+                        (NodeKind::Derived, format!("Forced by OR constraint #{constraint_id}"), Some(*constraint_id)),
+                };
+
+                let subtitle = if observed_status == LogicValue::Contradiction
+                {
+                    format!(
+                        "Used as {} here; both {} and !{} are proven",
+                        if literal.positive { "TRUE" } else { "FALSE" },
+                        literal.symbol,
+                        literal.symbol,
+                    )
+                }
+                else
+                {
+                    subtitle
+                };
+
+                self.add_node(ExplanationNode {
+                    id: event_id,
+                    kind,
+                    title: format!("{} established", literal_text(literal)),
+                    subtitle,
+                    event_id: Some(event_id),
+                    rule_id,
+                    literal: Some(literal),
+                    observed_status: Some(observed_status),
+                });
+
+                if forced_by_clause
+                {
+                    // Do not classify every causal predecessor as a refutation.
+                    // In particular, RuleApplied and ConstraintActivated are
+                    // evidence of *activation*, not proof that an alternative
+                    // is false. This previously created edges from A=>(E|K)
+                    // to an unrelated !K|L clause.
+                    if let ProofOrigin::UnitPropagation { constraint_id } = origin
+                    {
+                        self.resolve_forced_clause(
+                            event_id, literal, constraint_id, &causes
+                        );
+                    }
+                }
+                else
+                {
+                    let ancestors = causes.iter().flat_map(|cause| self.resolve(*cause))
+                        .collect::<Vec<_>>();
+                    for predecessor in ancestors
+                    {
+                        self.link(predecessor, event_id, LinkKind::Derives);
+                    }
+                }
+
+                vec![event_id]
+            }
+
+            TraceEventKind::RuleApplied { rule_id } =>
+            {
+                let (title, subtitle) = self.normalized_rule(rule_id);
+                self.add_node(ExplanationNode {
+                    id: event_id,
+                    kind: NodeKind::Rule,
+                    title,
+                    subtitle,
+                    event_id: Some(event_id),
+                    rule_id: Some(rule_id),
+                    literal: None,
+                    observed_status: None,
+                });
+
+                let ancestors = causes.iter().flat_map(|cause| self.resolve(*cause))
+                    .collect::<Vec<_>>();
+                for predecessor in ancestors
+                {
+                    self.link(predecessor, event_id, LinkKind::Premise);
+                }
+                vec![event_id]
+            }
+
+            TraceEventKind::ConstraintActivated { constraint_id, rule_id, literals } =>
+            {
+                let title = literals.iter().map(|literal| literal_text(*literal))
+                    .collect::<Vec<_>>().join(" | ");
+                self.add_node(ExplanationNode {
+                    id: event_id,
+                    kind: NodeKind::Clause,
+                    title,
+                    subtitle: format!("At least one must hold · from rule #{rule_id}"),
+                    event_id: Some(event_id),
+                    rule_id: Some(constraint_id),
+                    literal: None,
+                    observed_status: None,
+                });
+
+                let ancestors = causes.iter().flat_map(|cause| self.resolve(*cause))
+                    .collect::<Vec<_>>();
+                for predecessor in ancestors
+                {
+                    self.link(predecessor, event_id, LinkKind::Activates);
+                }
+                vec![event_id]
+            }
+
+            TraceEventKind::ProofReused { original_event, .. } =>
+                self.resolve(original_event),
+
+            // All other events are evidence carriers but not graphical steps.
+            // They remain available through the inspector's trace details.
+            _ =>
+            {
+                let mut sources = Vec::new();
+                for cause in causes
+                {
+                    sources.extend(self.resolve(cause));
+                }
+                sources.sort_unstable();
+                sources.dedup();
+                sources
+            }
+        }
+    }
+
+    /// Rebuild one unit-propagation step from *typed* evidence.
+    ///
+    /// The activation is matched to the constraint ID that actually forced
+    /// the literal; a refutation must be an explicit proof of the opposite
+    /// polarity of another literal *in that same clause*.
+    fn resolve_forced_clause(
+        &mut self,
+        proof_event: EventId,
+        forced: Literal,
+        constraint_id: usize,
+        causes: &[EventId],
+    )
+    {
+        let events = &self.query.trace.events;
+        let mut activation = None;
+        let mut clause_literals = None;
+
+        for &cause in causes
+        {
+            let Some(event) = events.get(cause as usize) else
+            {
+                continue;
+            };
+
+            let activation_id = match &event.kind
+            {
+                TraceEventKind::ConstraintActivated {
+                    constraint_id: index, ..
+                } if *index == constraint_id => Some(event.id),
+
+                TraceEventKind::ConstraintEvaluated {
+                    constraint_id: index, ..
+                } if *index == constraint_id => event.causes.iter().copied()
+                    .find(|&id| matches!(
+                        events.get(id as usize).map(|e| &e.kind),
+                        Some(TraceEventKind::ConstraintActivated {
+                            constraint_id: activated, ..
+                        }) if *activated == constraint_id
+                    )),
+
+                _ => None,
+            };
+
+            if let Some(id) = activation_id
+            {
+                if let Some(event) = events.get(id as usize)
+                {
+                    if let TraceEventKind::ConstraintActivated {
+                        literals, ..
+                    } = &event.kind
+                    {
+                        if literals.contains(&forced)
+                        {
+                            activation = Some(id);
+                            clause_literals = Some(literals.clone());
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        let clause_node = activation.and_then(|id|
+        {
+            self.resolve(id).into_iter().find(|candidate|
+            {
+                self.output.node(*candidate).is_some_and(|node|
+                {
+                    node.kind == NodeKind::Clause && node.event_id == Some(id)
+                })
+            })
+        });
+
+        // If the trace does not contain a matching activation, do not
+        // invent a causal relationship to another clause.
+        let Some(clause_node) = clause_node else
+        {
+            return;
+        };
+
+        self.link(clause_node, proof_event, LinkKind::Forces);
+        let Some(literals) = clause_literals else
+        {
+            return;
+        };
+
+        for &cause in causes
+        {
+            let Some(event) = self.query.trace.events.get(cause as usize) else
+            {
+                continue;
+            };
+
+            let evidence_id = match &event.kind
+            {
+                TraceEventKind::LiteralProven { .. } => Some(cause),
+                TraceEventKind::ProofReused { original_event, .. } =>
+                    Some(*original_event),
+                _ => None,
+            };
+
+            let Some(evidence_id) = evidence_id else
+            {
+                continue;
+            };
+
+            let Some(evidence) = self.query.trace.events.get(evidence_id as usize) else
+            {
+                continue;
+            };
+
+            let TraceEventKind::LiteralProven {
+                literal: established, ..
+            } = &evidence.kind else
+            {
+                continue;
+            };
+            let established = *established;
+
+            // Prove the *opposite* of another literal in this exact clause.
+            // A rule or a different clause cannot constitute a refutation.
+            if established.symbol == forced.symbol || !literals.iter().any(|candidate|
+                candidate.symbol == established.symbol
+                    && candidate.positive != established.positive)
+            {
+                continue;
+            }
+
+            let sources = self.resolve(evidence_id);
+            for source in sources
+            {
+                if self.output.node(source).is_some_and(|node|
+                    node.literal == Some(established)
+                        && matches!(node.kind, NodeKind::Fact | NodeKind::Derived))
+                {
+                    self.link(source, clause_node, LinkKind::RulesOut);
+                }
+            }
+        }
+    }
+
+    fn resolve_ancestors(&mut self, id: EventId) -> Vec<DisplayNodeId>
+    {
+        let Some(event) = self.query.trace.events.get(id as usize) else
+        {
+            return Vec::new();
+        };
+        let mut ancestors = event.causes.clone();
+        if let TraceEventKind::ProofReused { original_event, .. } = &event.kind
+        {
+            ancestors.push(*original_event);
+        }
+        let mut results = Vec::new();
+        for cause in ancestors
+        {
+            if cause < id
+            {
+                results.extend(self.resolve(cause));
+            }
+        }
+        results.sort_unstable();
+        results.dedup();
+        results
+    }
+
+    fn no_proof_context(&mut self)
+    {
+        match &self.query.outcome
+        {
+            QueryOutcome::Value(LogicValue::Undetermined) =>
+            {
+                // Unresolved clauses can explain ambiguity, but *do not*
+                // prove the queried literal. Use a distinct dashed link.
+                let clauses = self.query.trace.events.iter()
+                    .filter_map(|event|
+                    {
+                        let TraceEventKind::ConstraintActivated {
+                            literals, constraint_id, ..
+                        } = &event.kind else { return None; };
+                        if !literals.iter().any(|literal| literal.symbol == self.query.symbol)
+                        {
+                            return None;
+                        }
+                        let unresolved = self.query.trace.events.iter().any(|other|
+                        {
+                            matches!(&other.kind,
+                                TraceEventKind::ConstraintEvaluated {
+                                    constraint_id: idx,
+                                    result: ConstraintOutcome::Unresolved { .. },
+                                } if idx == constraint_id)
+                        });
+                        unresolved.then_some(event.id)
+                    })
+                    .collect::<Vec<_>>();
+
+                if clauses.is_empty()
+                {
+                    self.add_note(
+                        "Insufficient evidence",
+                        "Neither side could be established; one or more conditions remain unresolved.",
+                        LinkKind::Unresolved,
+                    );
+                }
+                else
+                {
+                    for id in clauses.into_iter().take(8)
+                    {
+                        for node in self.resolve(id)
+                        {
+                            self.link(node, QUERY_ID, LinkKind::Unresolved);
+                        }
+                    }
+                }
+            }
+            QueryOutcome::Value(LogicValue::False) =>
+            {
+                self.add_note(
+                    "No proof established",
+                    "No explicit !query proof was recorded. This engine returns False by default when no unresolved constraint applies. This is not a proof of negation.",
+                    LinkKind::Unresolved,
+                );
+            }
+            QueryOutcome::Error { message } =>
+            {
+                self.add_note(
+                    "Evaluation error",
+                    message,
+                    LinkKind::Unresolved,
+                );
+            }
+            _ =>
+            {
+                self.add_note(
+                    "No recorded proof",
+                    "The query result has no traceable final evidence.",
+                    LinkKind::Unresolved,
+                );
+            }
+        }
+    }
+
+    fn add_note(&mut self, title: &str, subtitle: &str, kind: LinkKind)
+    {
+        self.add_node(ExplanationNode {
+            id: NOTE_ID,
+            kind: NodeKind::Notice,
+            title: title.to_owned(),
+            subtitle: subtitle.to_owned(),
+            event_id: None,
+            rule_id: None,
+            literal: None,
+            observed_status: None,
+        });
+        self.link(NOTE_ID, QUERY_ID, kind);
+    }
+}
+
+#[cfg(test)]
+mod tests
+{
+    use super::*;
+    use crate::engine::{run_source, SolveMode};
+
+    fn explanation(source: &str) -> ExplanationGraph
+    {
+        let run = run_source(source, SolveMode::Sequential).unwrap();
+        let report = run.report.load_query(0).unwrap();
+        ExplanationGraph::new(&report, &report.queries[0])
+    }
+
+    #[test]
+    fn rule_labels_drop_only_the_outermost_pair_of_parentheses()
+    {
+        assert_eq!(
+            rule_display_expression("(A => (!B | !C))"),
+            "A => (!B | !C)",
+        );
+        assert_eq!(
+            rule_display_expression("((A + B) => (C | D))"),
+            "(A + B) => (C | D)",
+        );
+        assert_eq!(rule_display_expression("(A => B)"), "A => B");
+        assert_eq!(
+            rule_display_expression("(A) | (B)"),
+            "(A) | (B)",
+        );
+        assert_eq!(rule_display_expression("A => (!B | !C)"), "A => (!B | !C)");
+    }
+
+    #[test]
+    fn contradictory_initial_fact_still_supports_its_positive_rule()
+    {
+        let run = run_source("C=>B\nD=>!C\n=CD\n?B", SolveMode::Sequential)
+            .unwrap();
+        let report = run.report.load_query(0).unwrap();
+        let query = &report.queries[0];
+        assert!(matches!(query.outcome, QueryOutcome::Value(LogicValue::True)));
+        assert_eq!(observed_symbol_status(query, 'C'), LogicValue::Contradiction);
+
+        let graph = ExplanationGraph::new(&report, query);
+        let c = graph.nodes.iter().find(|node|
+            node.kind == NodeKind::Fact
+                && node.literal == Some(Literal { symbol: 'C', positive: true })
+        ).expect("C used as a positive initial fact");
+
+        assert_eq!(c.observed_status, Some(LogicValue::Contradiction));
+        assert!(c.subtitle.contains("Used as TRUE here"));
+        assert!(c.subtitle.contains("both C and !C are proven"));
+
+        let rule = graph.nodes.iter().find(|node|
+            node.kind == NodeKind::Rule && node.title == "C => B"
+        ).expect("normalized rule with no outer grouping pair");
+
+        assert!(graph.links.iter().any(|link|
+            link.from == c.id && link.to == rule.id
+                && link.kind == LinkKind::Premise
+        ));
+
+        // The stored normalized rule is not mutated for display.
+        assert!(report.rewrite.normalized_rules.iter()
+            .any(|rule| rule.expression == "(C => B)"));
+    }
+
+    #[test]
+    fn proof_shows_premise_rule_conclusion_and_answer()
+    {
+        let graph = explanation("A=>B\n=A\n?B");
+        assert!(graph.nodes.iter().any(|n| n.kind == NodeKind::Fact && n.title.contains('A')));
+        assert!(graph.nodes.iter().any(|n| n.kind == NodeKind::Rule && n.title.contains("=>")));
+        assert!(graph.nodes.iter().any(|n| n.kind == NodeKind::Derived && n.title.contains('B')));
+        assert!(graph.links.iter().any(|e| e.kind == LinkKind::Premise));
+        assert!(graph.links.iter().any(|e| e.kind == LinkKind::Derives));
+        assert!(graph.links.iter().any(|e| e.kind == LinkKind::Answer));
+        assert!(graph.nodes.len() < 8, "Do not render exploratory searches as evidence");
+    }
+
+    #[test]
+    fn contradiction_has_both_polarities()
+    {
+        let graph = explanation("A=>B\nC=>!B\n=AC\n?B");
+        assert!(graph.nodes.iter().any(|n|
+            n.literal == Some(Literal { symbol:'B', positive:true })));
+        assert!(graph.nodes.iter().any(|n|
+            n.literal == Some(Literal { symbol:'B', positive:false })));
+        assert_eq!(graph.links.iter().filter(|link| link.to == QUERY_ID &&
+            link.kind == LinkKind::Answer).count(), 2);
+    }
+
+    #[test]
+    fn absence_of_proof_is_labeled_not_invented()
+    {
+        let graph = explanation("A=>B\n=\n?B");
+        assert_eq!(graph.nodes.len(), 2);
+        assert!(graph.nodes.iter().any(|node| node.kind == NodeKind::Notice));
+        assert!(!graph.links.iter().any(|link| link.kind == LinkKind::Answer));
+    }
+
+    #[test]
+    fn unresolved_clause_is_explanatory_not_a_proof()
+    {
+        let graph = explanation("A=>B|C\n=A\n?B");
+        assert!(graph.nodes.iter().any(|n| n.kind == NodeKind::Clause));
+        assert!(graph.links.iter().any(|e| e.kind == LinkKind::Unresolved));
+        assert!(!graph.links.iter().any(|e| e.kind == LinkKind::Answer));
+    }
+
+    #[test]
+    fn forced_clause_has_refutation_and_derivation()
+    {
+        let graph = explanation("A=>B|C\nD=>!C\n=AD\n?B");
+        assert!(graph.nodes.iter().any(|node| node.kind == NodeKind::Clause));
+        assert!(graph.links.iter().any(|edge| edge.kind == LinkKind::Forces));
+        assert!(graph.links.iter().any(|edge| edge.kind == LinkKind::RulesOut));
+    }
+
+    #[test]
+    fn big_test_query_v_with_b_c_d_r_does_not_use_negative_literals_to_prove_or()
+    {
+        use crate::engine::run_source_with_facts;
+
+        // Exact GUI scenario: source facts ABCD, A unchecked, R checked.
+        let source = include_str!("../../../big_test.txt")
+            .replace("?ABCDEFGHIJKLMNOPQRSTUVWXYZ", "?V");
+        let mut enabled = [false; 26];
+        for symbol in b"BCDR"
+        {
+            enabled[(symbol - b'A') as usize] = true;
+        }
+
+        let run = run_source_with_facts(&source, SolveMode::Sequential, enabled)
+            .unwrap();
+        let report = run.report.load_query(0).unwrap();
+        let query = &report.queries[0];
+        let graph = ExplanationGraph::new(&report, query);
+
+        assert_eq!(query.symbol, 'V');
+
+        // The big knowledge base can exceed the explicit trace budget.
+        // In that case, the engine result is valid but the partial trace
+        // must NOT be interpreted as a complete graphical proof. Signed
+        // premise dependencies are tested on smaller complete traces above.
+        if query.trace.truncated
+        {
+            assert!(query.trace.events.len()
+                <= crate::trace::MAX_TRACE_EVENTS_PER_QUERY);
+            assert!(query.graph.nodes.is_empty());
+            return;
+        }
+        assert!(conflicting_symbols(query).contains(&'R'),
+            "C=>!R conflicts with enabled R");
+        assert_eq!(observed_symbol_status(query, 'C'), LogicValue::Contradiction);
+        // A focused proof only includes dependencies actually used. C may
+        // be contradictory during this query without appearing on the
+        // shortest supported route to V.
+        if let Some(c_fact) = graph.nodes.iter().find(|node|
+            node.kind == NodeKind::Fact
+                && node.literal == Some(Literal { symbol: 'C', positive: true })
+        )
+        {
+            assert_eq!(c_fact.observed_status, Some(LogicValue::Contradiction));
+            assert!(c_fact.subtitle.contains("Used as TRUE here"));
+        }
+
+        // If this rule is present in the displayed proof, its incoming
+        // premises must be *positive* R or T, never !R or !T.
+        for applied_rule in graph.nodes.iter().filter(|node|
+            node.kind == NodeKind::Rule && node.title.contains("(R | T)")
+        )
+        {
+            let premises = graph.links.iter().filter(|link|
+                link.to == applied_rule.id && link.kind == LinkKind::Premise
+            ).filter_map(|link| graph.node(link.from)).collect::<Vec<_>>();
+
+            assert!(premises.iter().any(|node|
+                node.literal == Some(Literal { symbol: 'R', positive: true })
+                || node.literal == Some(Literal { symbol: 'T', positive: true })),
+                "R|T must have positive supporting evidence");
+            assert!(!premises.iter().any(|node|
+                node.literal == Some(Literal { symbol: 'R', positive: false })
+                || node.literal == Some(Literal { symbol: 'T', positive: false })),
+                "Negative literals cannot prove R|T");
+        }
+    }
+
+    #[test]
+    fn contradictory_premise_is_reported_without_becoming_a_false_prerequisite()
+    {
+        let run = run_source("C=>!R\nD=>!T\nR|T=>!C\n=CDR\n?C", SolveMode::Sequential).unwrap();
+        let report = run.report.load_query(0).unwrap();
+        let query = &report.queries[0];
+        assert_eq!(conflicting_symbols(query), vec!['C', 'R']);
+    }
+
+    #[test]
+    fn contradictory_R_does_not_make_not_R_or_not_T_support_R_or_T()
+    {
+        let graph = explanation("C=>!R\nD=>!T\nR|T=>!C\n=CDR\n?C");
+
+        let rule = graph.nodes.iter().find(|node|
+            node.kind == NodeKind::Rule && node.title.contains("(R | T)")
+        ).expect("applied R|T rule");
+        let upstream = graph.links.iter().filter(|edge|
+            edge.to == rule.id && edge.kind == LinkKind::Premise
+        ).filter_map(|edge| graph.node(edge.from)).collect::<Vec<_>>();
+
+        assert!(upstream.iter().any(|node|
+            node.literal == Some(Literal { symbol: 'R', positive: true })),
+            "Positive R is sufficient to support the OR premise");
+        assert!(!upstream.iter().any(|node|
+            node.literal == Some(Literal { symbol: 'R', positive: false })
+            || node.literal == Some(Literal { symbol: 'T', positive: false })),
+            "Negative R/T evidence must not justify a positive OR premise");
+
+        let answer = graph.node(graph.root).unwrap();
+        assert!(answer.title.contains("CONTRADICTION"));
+        assert!(graph.nodes.iter().any(|node|
+            node.literal == Some(Literal { symbol: 'C', positive: false })),
+            "The rule must still be able to derive !C from positive R");
+    }
+
+    #[test]
+    fn a_rule_activates_its_own_or_clause_and_not_another_clause()
+    {
+        // Minimal reproduction of the incorrectly rendered A => (E | K)
+        // edge. Only !K may rule out K, and only A's rule activates E | K.
+        let graph = explanation("A=>E|K\nB=>!K\n=AB\n?E");
+
+        let applied = graph.nodes.iter().find(|node|
+            node.kind == NodeKind::Rule && node.title.contains("E | K")
+        ).expect("applied A=>E|K rule");
+        let clause = graph.nodes.iter().find(|node|
+            node.kind == NodeKind::Clause && node.title == "E | K"
+        ).expect("activated E|K clause");
+        let refutation = graph.nodes.iter().find(|node|
+            node.literal == Some(Literal {symbol:'K', positive:false})
+        ).expect("explicit !K");
+
+        assert!(graph.links.iter().any(|edge|
+            edge.from == applied.id && edge.to == clause.id
+                && edge.kind == LinkKind::Activates
+        ));
+        assert!(graph.links.iter().any(|edge|
+            edge.from == refutation.id && edge.to == clause.id
+                && edge.kind == LinkKind::RulesOut
+        ));
+        assert!(!graph.links.iter().any(|edge|
+            edge.from == applied.id && edge.kind == LinkKind::RulesOut
+        ));
+    }
+
+    #[test]
+    fn rules_out_edges_only_come_from_explicit_literal_refutations()
+    {
+        // Exercises the exact overlapping E|K and !K|L clause pattern
+        // from the large expert-system input.
+        let run = run_source(include_str!("../../../big_test.txt"), SolveMode::Sequential).unwrap();
+        let report = run.report.load_query(0).unwrap();
+        let query = &report.queries[0];
+        let graph = ExplanationGraph::new(&report, query);
+        for link in graph.links.iter().filter(|edge| edge.kind == LinkKind::RulesOut)
+        {
+            let from = graph.node(link.from).unwrap();
+            let to = graph.node(link.to).unwrap();
+            assert!(
+                matches!(from.kind, NodeKind::Fact | NodeKind::Derived),
+                "Only a proven literal may rule out an alternative: {:?} -> {:?}",
+                from, to
+            );
+            assert_eq!(to.kind, NodeKind::Clause);
+            let established = from.literal.expect("explicit proof");
+            let clause = to.event_id.expect("constraint activation");
+            // The exact underlying clause must contain the opposite
+            // polarity to the established literal.
+            let TraceEventKind::ConstraintActivated { literals, .. } =
+                &query.trace.events[clause as usize].kind else
+            {
+                panic!("Refuted clause does not point at an activation event");
+            };
+            assert!(literals.iter().any(|candidate|
+                candidate.symbol == established.symbol
+                    && candidate.positive != established.positive
+            ));
+        }
+    }
+
+    #[test]
+    fn an_applied_rule_only_activates_its_own_constraint()
+    {
+        let run = run_source(include_str!("../../../big_test.txt"), SolveMode::Sequential).unwrap();
+        let report = run.report.load_query(4).unwrap();
+        let query = &report.queries[0]; // E
+        let graph = ExplanationGraph::new(&report, query);
+
+        for link in graph.links.iter().filter(|edge| edge.kind == LinkKind::Activates)
+        {
+            let source = graph.node(link.from).unwrap();
+            let target = graph.node(link.to).unwrap();
+
+            let (Some(rule_event), Some(constraint_event)) =
+                (source.event_id, target.event_id) else
+            {
+                panic!("Activation edge missing causal event IDs");
+            };
+            let TraceEventKind::RuleApplied { rule_id: source_rule } =
+                &query.trace.events[rule_event as usize].kind else
+            {
+                panic!("Activation source must be an applied rule");
+            };
+            let TraceEventKind::ConstraintActivated { rule_id: target_rule, .. } =
+                &query.trace.events[constraint_event as usize].kind else
+            {
+                panic!("Activation target must be a real OR clause");
+            };
+            assert_eq!(
+                source_rule, target_rule,
+                "Rule #{source_rule} must not activate rule #{target_rule}'s clause"
+            );
+        }
+        assert!(graph.links.iter().all(|edge|
+        {
+            if edge.kind == LinkKind::RulesOut
+            {
+                graph.node(edge.from).is_some_and(|node|
+                    matches!(node.kind, NodeKind::Fact | NodeKind::Derived))
+            }
+            else { true }
+        }));
+    }
+
+    #[test]
+    fn explanation_nodes_do_not_duplicate_visits()
+    {
+        let graph = explanation(include_str!("../../../test.txt"));
+        let mut ids = HashSet::new();
+        assert!(graph.nodes.iter().all(|node| ids.insert(node.id)));
+        assert!(graph.links.iter().all(|link| ids.contains(&link.from) && ids.contains(&link.to)));
+    }
+}

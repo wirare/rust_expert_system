@@ -4,6 +4,7 @@ pub mod grammar;
 pub mod gui;
 pub mod lexer;
 pub mod report;
+pub mod report_store;
 pub mod system;
 pub mod tokenizer;
 pub mod trace;
