@@ -62,12 +62,18 @@ Given fact A  -->  Applied rule A => B  -->  Derived B  -->  Query B = TRUE
 - Nodes **cannot be dragged, repositioned, or edited**. The graph can be
   panned with scrollbars and zoomed between 70% and 145%.
 - A contradictory result has **separate positive and negative proof paths**.
-  Conflicting evidence encountered during a query (for example enabled R
-  together with C=>!R) is also listed as a diagnostic warning. The graph
-  follows only supporting polarity for each applied premise, so !R cannot
-  falsely appear as evidence for R|T. If the engine falls back to False
-  without a negative proof, an explanatory notice explicitly states that
-  default False is not a proven negation.
+  Any fact or deduction for which the current query has established both
+  polarities now carries a visible **C & !C PROVEN** marker (using its own
+  symbol). Its card and inspector explicitly identify which positive or
+  negative witness supports **this** deduction. That proof remains valid;
+  the opposing proof is listed separately in the inspector and diagnostic
+  warning without being drawn as a prerequisite. This is the existing
+  paraconsistent behavior, not a change to inference semantics.
+- Applied-rule cards omit only the redundant outer grouping parentheses,
+  e.g. `(A => (!B | !C))` displays as `A => (!B | !C)`. The internal
+  normalized AST and rewrite history stay unchanged.
+- If the engine falls back to False without a negative proof, an explanatory
+  notice explicitly states that default False is not a proven negation.
   Unresolved OR constraints are linked with a **dashed, non-proof** arrow.
 - The canvas is an explanation extracted from causal trace dependencies.
   Exploratory, unsuccessful search attempts are intentionally omitted from
