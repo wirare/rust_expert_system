@@ -139,7 +139,17 @@ fn node_details(
                     {
                         section(ui, "Premise evaluation");
                         ui.label(format!("Most recent recorded evaluation: {result:?}"));
-                        ui.small("Only rules that were applied appear in this proof view.");
+                        if *result == LogicValue::Contradiction
+                        {
+                            wrapped(ui,
+                                "This premise has both positive and negative support. \
+The rule can be applied because positive support exists; only that supporting \
+witness is connected to the rule in the explanation graph.");
+                        }
+                        else
+                        {
+                            ui.small("Only rules that were applied appear in this proof view.");
+                        }
                     }
                 }
             }
