@@ -759,7 +759,8 @@ mod tests
     fn explanation(source: &str) -> ExplanationGraph
     {
         let run = run_source(source, SolveMode::Sequential).unwrap();
-        ExplanationGraph::new(&run.execution, &run.execution.queries[0])
+        let report = run.report.load_query(0).unwrap();
+        ExplanationGraph::new(&report, &report.queries[0])
     }
 
     #[test]
@@ -786,11 +787,12 @@ mod tests
     {
         let run = run_source("C=>B\nD=>!C\n=CD\n?B", SolveMode::Sequential)
             .unwrap();
-        let query = &run.execution.queries[0];
+        let report = run.report.load_query(0).unwrap();
+        let query = &report.queries[0];
         assert!(matches!(query.outcome, QueryOutcome::Value(LogicValue::True)));
         assert_eq!(observed_symbol_status(query, 'C'), LogicValue::Contradiction);
 
-        let graph = ExplanationGraph::new(&run.execution, query);
+        let graph = ExplanationGraph::new(&report, query);
         let c = graph.nodes.iter().find(|node|
             node.kind == NodeKind::Fact
                 && node.literal == Some(Literal { symbol: 'C', positive: true })
@@ -810,7 +812,7 @@ mod tests
         ));
 
         // The stored normalized rule is not mutated for display.
-        assert!(run.execution.rewrite.normalized_rules.iter()
+        assert!(report.rewrite.normalized_rules.iter()
             .any(|rule| rule.expression == "(C => B)"));
     }
 
@@ -882,8 +884,9 @@ mod tests
 
         let run = run_source_with_facts(&source, SolveMode::Sequential, enabled)
             .unwrap();
-        let query = &run.execution.queries[0];
-        let graph = ExplanationGraph::new(&run.execution, query);
+        let report = run.report.load_query(0).unwrap();
+        let query = &report.queries[0];
+        let graph = ExplanationGraph::new(&report, query);
 
         assert_eq!(query.symbol, 'V');
         assert!(conflicting_symbols(query).contains(&'R'),
@@ -921,7 +924,8 @@ mod tests
     fn contradictory_premise_is_reported_without_becoming_a_false_prerequisite()
     {
         let run = run_source("C=>!R\nD=>!T\nR|T=>!C\n=CDR\n?C", SolveMode::Sequential).unwrap();
-        let query = &run.execution.queries[0];
+        let report = run.report.load_query(0).unwrap();
+        let query = &report.queries[0];
         assert_eq!(conflicting_symbols(query), vec!['C', 'R']);
     }
 
@@ -988,8 +992,9 @@ mod tests
         // Exercises the exact overlapping E|K and !K|L clause pattern
         // from the large expert-system input.
         let run = run_source(include_str!("../../../big_test.txt"), SolveMode::Sequential).unwrap();
-        let query = &run.execution.queries[0];
-        let graph = ExplanationGraph::new(&run.execution, query);
+        let report = run.report.load_query(0).unwrap();
+        let query = &report.queries[0];
+        let graph = ExplanationGraph::new(&report, query);
         for link in graph.links.iter().filter(|edge| edge.kind == LinkKind::RulesOut)
         {
             let from = graph.node(link.from).unwrap();
@@ -1020,8 +1025,9 @@ mod tests
     fn an_applied_rule_only_activates_its_own_constraint()
     {
         let run = run_source(include_str!("../../../big_test.txt"), SolveMode::Sequential).unwrap();
-        let query = &run.execution.queries[4]; // E
-        let graph = ExplanationGraph::new(&run.execution, query);
+        let report = run.report.load_query(4).unwrap();
+        let query = &report.queries[0]; // E
+        let graph = ExplanationGraph::new(&report, query);
 
         for link in graph.links.iter().filter(|edge| edge.kind == LinkKind::Activates)
         {
