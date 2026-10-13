@@ -245,7 +245,7 @@ impl eframe::App for ExpertSystemApp
                         {
                             self.graph_viewer.show(
                                 ui,
-                                &run.execution,
+                                run,
                                 self.runner.revision(),
                             );
                         }
