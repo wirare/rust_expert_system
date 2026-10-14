@@ -1,3 +1,5 @@
+use std::cmp::max;
+
 use crate::tokenizer::{Token, TokenType};
 
 pub fn lex<'a>(input: &'a str) -> Result <Vec<Token<'a>>, String>
@@ -18,6 +20,11 @@ pub fn lex<'a>(input: &'a str) -> Result <Vec<Token<'a>>, String>
             }
 
             let remaining = &input[pos..];
+
+            let remaining = remaining
+                .split_once('#')
+                .map_or(remaining, |(before, _)| before)
+                .trim_end();
 
             let matched = TokenType::ALL
                 .iter()
