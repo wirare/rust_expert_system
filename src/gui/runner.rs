@@ -5,7 +5,7 @@ use std::sync::mpsc::{self, Receiver, TryRecvError};
 
 use eframe::egui;
 
-use crate::engine::{RunReport, SolveMode, run_source_with_facts};
+use crate::engine::{RunReport, SolveMode, run_source_with_overrides};
 
 pub enum RunState
 {
@@ -77,6 +77,7 @@ impl RunController
         source: String,
         mode: SolveMode,
         active_facts: [bool; 26],
+        active_queries: [bool; 26],
         context: egui::Context,
     )
     {
@@ -94,7 +95,9 @@ impl RunController
         {
             let result = std::panic::catch_unwind(||
             {
-                run_source_with_facts(&source, mode, active_facts)
+                run_source_with_overrides(
+                    &source, mode, active_facts, active_queries,
+                )
             });
 
             let result = match result

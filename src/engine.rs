@@ -65,13 +65,40 @@ pub fn source_initial_facts(source: &str) -> [bool; 26]
     enabled
 }
 
+/// Discover the default query selection from the source's '?...' line.
+///
+/// This is a lightweight UI projection; the parser remains responsible for
+/// validating query syntax and reporting the source line of any error.
+pub fn source_queries(source: &str) -> [bool; 26]
+{
+    let mut enabled = [false; 26];
+
+    for raw in source.lines()
+    {
+        let line = raw.split('#').next().unwrap_or("").trim_start();
+        if let Some(queries) = line.strip_prefix('?')
+        {
+            for symbol in queries.bytes()
+            {
+                if symbol.is_ascii_uppercase()
+                {
+                    enabled[(symbol - b'A') as usize] = true;
+                }
+            }
+            break;
+        }
+    }
+
+    enabled
+}
+
 /// Parse, normalize, and evaluate the *current source snapshot*.
 ///
 /// An input/initialization error fails the entire run. An inference error
 /// belongs to one query and is retained beside that query's symbol.
 pub fn run_source(source: &str, mode: SolveMode) -> Result<RunReport, String>
 {
-    run_source_inner(source, mode, None)
+    run_source_inner(source, mode, None, None)
 }
 
 /// Evaluate using an independently selected initial-fact set. Neither the
@@ -82,13 +109,28 @@ pub fn run_source_with_facts(
     active_facts: [bool; 26],
 ) -> Result<RunReport, String>
 {
-    run_source_inner(source, mode, Some(active_facts))
+    run_source_inner(source, mode, Some(active_facts), None)
+}
+
+/// Run with independent runtime fact and query selections.
+///
+/// GUI toggles never change source text. Only the selected queries are
+/// solved, traced, and included in the generated JSON reasoning report.
+pub fn run_source_with_overrides(
+    source: &str,
+    mode: SolveMode,
+    active_facts: [bool; 26],
+    active_queries: [bool; 26],
+) -> Result<RunReport, String>
+{
+    run_source_inner(source, mode, Some(active_facts), Some(active_queries))
 }
 
 fn run_source_inner(
     source: &str,
     mode: SolveMode,
     active_facts: Option<[bool; 26]>,
+    active_queries: Option<[bool; 26]>,
 ) -> Result<RunReport, String>
 {
     let started = Instant::now();
@@ -98,6 +140,10 @@ fn run_source_inner(
     if let Some(facts) = active_facts
     {
         system.replace_initial_facts(facts)?;
+    }
+    if let Some(queries) = active_queries
+    {
+        system.replace_queries(queries)?;
     }
     system.compute_rules_for_symbols();
 
@@ -305,6 +351,87 @@ mod tests
     {
         let error = run_source_with_facts("A=>\n=A\n?B", SolveMode::Parallel, [true; 26])
             .unwrap_err();
+        assert!(error.contains("Line 1"));
+    }
+
+    #[test]
+    fn query_detection_skips_comments_and_whitespace()
+    {
+        let source = "# ?XYZ is ignored\nA=>B\n=A\n  ? B D # E is commented";
+        let queries = source_queries(source);
+        assert!(queries[1]);
+        assert!(!queries[2]);
+        assert!(queries[3]);
+        assert!(!queries[4]);
+        assert!(!queries[23]);
+    }
+
+    #[test]
+    fn runtime_query_selection_limits_results_and_json_without_editing_source()
+    {
+        let source = "A=>B\nC=>D\n=A\n?DB".to_owned();
+        let untouched = source.clone();
+        let mut facts = [false; 26];
+        facts[0] = true;
+        let mut queries = [false; 26];
+        queries[0] = true; // Newly selected A.
+        queries[1] = true; // Existing B.
+        queries[2] = true; // Newly selected C.
+        // Existing D is unchecked.
+
+        for mode in [SolveMode::Sequential, SolveMode::Parallel]
+        {
+            let report = run_source_with_overrides(&source, mode, facts, queries).unwrap();
+            let symbols = report.results.iter().map(|result| result.symbol)
+                .collect::<Vec<_>>();
+            assert_eq!(symbols, ['B', 'A', 'C']);
+            assert_eq!(report.results[0].value, Ok(LogicValue::True));
+            assert_eq!(report.results[1].value, Ok(LogicValue::True));
+            assert_eq!(report.results[2].value, Ok(LogicValue::False));
+
+            // Only the selected query traces are written to the JSON file,
+            // in exactly the same order as the displayed results.
+            for (index, &symbol) in symbols.iter().enumerate()
+            {
+                let selected = report.report.load_query(index).unwrap();
+                assert_eq!(selected.queries.len(), 1);
+                assert_eq!(selected.queries[0].symbol, symbol);
+            }
+            assert!(report.report.load_query(symbols.len()).is_err());
+        }
+
+        assert_eq!(source, untouched);
+        // Original CLI still follows the declaration and its source order.
+        let original = run_source(&source, SolveMode::Sequential).unwrap();
+        assert_eq!(original.results.iter().map(|result| result.symbol)
+            .collect::<Vec<_>>(), ['D', 'B']);
+    }
+
+    #[test]
+    fn empty_query_selection_is_rejected_without_erasing_the_declaration()
+    {
+        let source = "A=>B\n=A\n?B";
+        let mut facts = [false; 26];
+        facts[0] = true;
+        let error = run_source_with_overrides(
+            source,
+            SolveMode::Sequential,
+            facts,
+            [false; 26],
+        ).unwrap_err();
+        assert!(error.contains("Select at least one query"));
+        assert_eq!(source_queries(source)[1], true);
+    }
+
+    #[test]
+    fn query_overrides_do_not_hide_source_parse_errors()
+    {
+        let error = run_source_with_overrides(
+            "A=>\n=A\n?B",
+            SolveMode::Parallel,
+            [true; 26],
+            [true; 26],
+        ).unwrap_err();
         assert!(error.contains("Line 1"));
     }
 

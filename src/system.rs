@@ -278,6 +278,51 @@ impl<'a> System<'a>
         Ok(())
     }
 
+    /// Override the set of evaluated queries for one frontend run.
+    ///
+    /// Existing source queries retain their declared order. Newly enabled
+    /// symbols are appended A-Z. Neither the source's '?...' declaration nor
+    /// the rules, facts, or rewrite history are modified.
+    pub fn replace_queries(&mut self, enabled: [bool; 26]) -> Result<(), String>
+    {
+        if !self.query_filled
+        {
+            return Err("The source has no query declaration".to_owned());
+        }
+
+        if !enabled.iter().any(|&active| active)
+        {
+            return Err("Select at least one query to evaluate".to_owned());
+        }
+
+        let mut selected = Vec::new();
+        let mut added = [false; 26];
+
+        for &symbol in &self.query
+        {
+            if symbol.is_ascii_uppercase()
+            {
+                let index = symbol as usize - 'A' as usize;
+                if enabled[index] && !added[index]
+                {
+                    selected.push(symbol);
+                    added[index] = true;
+                }
+            }
+        }
+
+        for (index, &active) in enabled.iter().enumerate()
+        {
+            if active && !added[index]
+            {
+                selected.push((b'A' + index as u8) as char);
+            }
+        }
+
+        self.query = selected;
+        Ok(())
+    }
+
     fn build_constraint(node: ASTNode, set: &mut HashSet<(char, bool)>, previous_is_not: bool) -> bool
     {
         match node.token.token_type
