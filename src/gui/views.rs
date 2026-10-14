@@ -7,6 +7,7 @@ use crate::trace::LogicValue;
 
 use super::document::SourceDocument;
 use super::facts::FactControls;
+use super::queries::QueryControls;
 use super::runner::RunState;
 
 /// Draw the current source file. Returns true if the user changed its contents.
@@ -117,6 +118,75 @@ pub fn fact_editor(ui: &mut egui::Ui, facts: &mut FactControls, editable: bool) 
             "{} override(s) active. Reset restores the source's initial facts.",
             facts.override_count()
         ));
+    }
+
+    changed
+}
+
+/// Query controls are runtime-only; they never rewrite the '?...' line.
+/// Return true when the active set of evaluated queries changes.
+pub fn query_editor(ui: &mut egui::Ui, queries: &mut QueryControls, editable: bool) -> bool
+{
+    let mut changed = false;
+
+    ui.horizontal_wrapped(|ui|
+    {
+        ui.strong("Queries");
+        ui.weak("Choose which symbols to evaluate; does not modify the file");
+
+        if ui.add_enabled(
+            editable && queries.override_count() > 0,
+            egui::Button::new("Reset queries to source"),
+        ).clicked()
+        {
+            queries.restore_source();
+            changed = true;
+        }
+    });
+
+    ui.add_enabled_ui(editable, |ui|
+    {
+        egui::Grid::new("query_selection_toggles")
+            .num_columns(13)
+            .spacing([12.0, 5.0])
+            .show(ui, |ui|
+            {
+                for index in 0..26
+                {
+                    let mut active = queries.enabled(index);
+                    let symbol = (b'A' + index as u8) as char;
+                    if ui.checkbox(&mut active, symbol.to_string()).changed()
+                    {
+                        queries.set_enabled(index, active);
+                        changed = true;
+                    }
+                    if index == 12
+                    {
+                        ui.end_row();
+                    }
+                }
+            });
+    });
+
+    ui.small(format!(
+        "{} selected{}",
+        queries.enabled_count(),
+        if queries.override_count() == 0
+        {
+            String::new()
+        }
+        else
+        {
+            format!(" · {} runtime override(s) active", queries.override_count())
+        },
+    ));
+
+    if queries.enabled_count() == 0
+    {
+        ui.colored_label(
+            egui::Color32::from_rgb(244, 169, 94),
+            "Enable at least one query to run the engine.",
+        );
     }
 
     changed
