@@ -6,6 +6,7 @@ use crate::engine::SolveMode;
 
 use super::document::SourceDocument;
 use super::facts::FactControls;
+use super::queries::QueryControls;
 use super::graph::GraphViewer;
 use super::runner::RunState;
 use super::runner::RunController;
@@ -24,6 +25,7 @@ pub struct ExpertSystemApp
 {
     document: SourceDocument,
     facts: FactControls,
+    queries: QueryControls,
     runner: RunController,
     parallel: bool,
     file_error: Option<String>,
@@ -57,9 +59,10 @@ impl ExpertSystemApp
         {
             Ok(Some(document)) =>
             {
-                // Loading another document resets runtime overrides; it does
-                // not carry facts from the previously opened file.
+                // Loading another document resets both fact and query
+                // overrides instead of carrying them from the previous file.
                 self.facts = FactControls::from_document(&document.text);
+                self.queries = QueryControls::from_document(&document.text);
                 self.document = document;
                 self.runner.clear();
                 self.file_error = None;
@@ -93,9 +96,9 @@ impl ExpertSystemApp
         }
     }
 
-    /// Fact checkbox changes are executed immediately, using the editor's
-    /// current text and the selected sequential/parallel mode.
-    fn on_facts_changed(&mut self, context: egui::Context)
+    /// Runtime fact/query checkbox changes immediately rerun the currently
+    /// selected queries without editing the source document.
+    fn on_selection_changed(&mut self, context: egui::Context)
     {
         if self.document.has_input() && !self.runner.is_running()
         {
@@ -109,6 +112,15 @@ impl ExpertSystemApp
 
     fn run_engine(&mut self, context: egui::Context)
     {
+        if self.queries.enabled_count() == 0
+        {
+            self.runner.clear();
+            self.file_error = Some(
+                "Select at least one query before running the engine".to_owned()
+            );
+            return;
+        }
+
         let mode = if self.parallel
         {
             SolveMode::Parallel
@@ -123,6 +135,7 @@ impl ExpertSystemApp
             self.document.text.clone(),
             mode,
             self.facts.enabled_mask(),
+            self.queries.enabled_mask(),
             context,
         );
     }
@@ -195,7 +208,17 @@ impl eframe::App for ExpertSystemApp
             if views::fact_editor(ui, &mut self.facts, fact_controls_enabled)
             {
                 // Re-evaluate immediately, including after Reset to source.
-                self.on_facts_changed(ui.ctx().clone());
+                self.on_selection_changed(ui.ctx().clone());
+            }
+
+            ui.add_space(5.0);
+            ui.separator();
+            ui.add_space(5.0);
+
+            if views::query_editor(ui, &mut self.queries, fact_controls_enabled)
+            {
+                // Query switches and Reset queries also start a fresh run.
+                self.on_selection_changed(ui.ctx().clone());
             }
 
             if let Some(error) = &self.file_error
@@ -222,6 +245,7 @@ impl eframe::App for ExpertSystemApp
                         )
                         {
                             self.facts.sync_source(&self.document.text);
+                            self.queries.sync_source(&self.document.text);
                             self.runner.clear();
                             self.file_error = None;
                         }
@@ -317,10 +341,11 @@ mod tests
         let mut app = ExpertSystemApp::default();
         app.document.text = "A=>B\n=A\n?B".to_owned();
         app.facts = FactControls::from_document(&app.document.text);
+        app.queries = QueryControls::from_document(&app.document.text);
 
         // The file still contains '=A', but the runtime checkbox disables A.
         app.facts.set_enabled(0, false);
-        app.on_facts_changed(egui::Context::default());
+        app.on_selection_changed(egui::Context::default());
         assert!(matches!(app.runner.state, RunState::Running));
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -345,15 +370,108 @@ mod tests
     }
 
     #[test]
+    fn toggling_queries_reruns_and_changes_only_runtime_selection()
+    {
+        let mut app = ExpertSystemApp::default();
+        app.document.text = "A=>B\nA=>C\n=A\n?BC".to_owned();
+        app.facts = FactControls::from_document(&app.document.text);
+        app.queries = QueryControls::from_document(&app.document.text);
+
+        // Disable B and enable A. The original source remains '?BC'.
+        app.queries.set_enabled(1, false);
+        app.queries.set_enabled(0, true);
+        app.on_selection_changed(egui::Context::default());
+        assert!(matches!(app.runner.state, RunState::Running));
+
+        let deadline = std::time::Instant::now()
+            + std::time::Duration::from_secs(5);
+        while app.runner.is_running() && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            app.runner.poll();
+        }
+
+        match &app.runner.state
+        {
+            RunState::Completed(report) =>
+            {
+                let symbols = report.results.iter()
+                    .map(|result| result.symbol).collect::<Vec<_>>();
+                assert_eq!(symbols, ['C', 'A']);
+                assert!(report.results.iter().all(|result|
+                    result.value == Ok(crate::trace::LogicValue::True)
+                ));
+                assert_eq!(report.report.load_query(0).unwrap().queries[0].symbol, 'C');
+                assert_eq!(report.report.load_query(1).unwrap().queries[0].symbol, 'A');
+                assert!(report.report.load_query(2).is_err());
+            }
+            RunState::Failed(error) => panic!("Unexpected query error: {error}"),
+            _ => panic!("Query toggle did not complete its auto-run"),
+        }
+        assert_eq!(app.document.text, "A=>B\nA=>C\n=A\n?BC");
+        assert!(!app.document.modified);
+    }
+
+    #[test]
+    fn reset_queries_reruns_in_parallel_and_restores_source_selection()
+    {
+        let mut app = ExpertSystemApp::default();
+        app.parallel = true;
+        app.document.text = "A=>B\n=A\n?B".to_owned();
+        app.facts = FactControls::from_document(&app.document.text);
+        app.queries = QueryControls::from_document(&app.document.text);
+        app.queries.set_enabled(0, true);
+        app.queries.restore_source();
+        app.on_selection_changed(egui::Context::default());
+
+        let deadline = std::time::Instant::now()
+            + std::time::Duration::from_secs(5);
+        while app.runner.is_running() && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            app.runner.poll();
+        }
+
+        match &app.runner.state
+        {
+            RunState::Completed(report) =>
+            {
+                assert_eq!(report.mode, SolveMode::Parallel);
+                assert_eq!(report.results.len(), 1);
+                assert_eq!(report.results[0].symbol, 'B');
+            }
+            RunState::Failed(error) => panic!("Unexpected query error: {error}"),
+            _ => panic!("Query reset did not complete its auto-run"),
+        }
+    }
+
+    #[test]
+    fn disabling_every_query_clears_old_results_and_prompts_selection()
+    {
+        let mut app = ExpertSystemApp::default();
+        app.document.text = "=A\n?A".to_owned();
+        app.facts = FactControls::from_document(&app.document.text);
+        app.queries = QueryControls::from_document(&app.document.text);
+        app.queries.set_enabled(0, false);
+        app.on_selection_changed(egui::Context::default());
+
+        assert!(matches!(app.runner.state, RunState::Idle));
+        assert!(app.file_error.as_deref().unwrap_or("")
+            .contains("Select at least one query"));
+        assert_eq!(app.document.text, "=A\n?A");
+    }
+
+    #[test]
     fn resetting_facts_can_rerun_in_parallel()
     {
         let mut app = ExpertSystemApp::default();
         app.parallel = true;
         app.document.text = "A=>B\n=A\n?B".to_owned();
         app.facts = FactControls::from_document(&app.document.text);
+        app.queries = QueryControls::from_document(&app.document.text);
         app.facts.set_enabled(0, false);
         app.facts.restore_source();
-        app.on_facts_changed(egui::Context::default());
+        app.on_selection_changed(egui::Context::default());
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while app.runner.is_running() && std::time::Instant::now() < deadline
