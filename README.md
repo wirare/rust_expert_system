@@ -30,9 +30,25 @@ the engine in the currently selected sequential/parallel mode, updating the
 results without requiring **Run engine**. If you edit the `=...` line, source
 defaults update while intentional checkbox overrides remain in effect until reset.
 
+**Queries** are displayed as a separate A-Z checkbox grid, defaulting to
+the source's `?...` declaration. Select or deselect any symbol to control
+which queries the engine evaluates, displays in Results, and serializes into
+the JSON reasoning report. Each query toggle immediately re-runs inference
+with the currently selected fact overrides and sequential/parallel mode.
+Existing source queries preserve their declared order, and newly enabled
+queries are appended in alphabetical order. `Reset queries to source`
+restores the file's original query selection and immediately re-runs.
+Neither toggling queries nor resetting them edits the source file or its
+`?...` declaration. The choices survive unsaved source edits until reset
+and are cleared when a different file is opened.
+
+If every query checkbox is unchecked, previous results are cleared and the
+GUI prompts you to enable at least one query; no unnecessary inference or
+trace generation is performed.
+
 Opening another file or editing the current source resets the results.
-Changing a fact toggle immediately starts a fresh run. Input and mode controls
-are disabled while a run is in progress.
+Changing a fact or query toggle immediately starts a fresh run. Input, fact,
+query, and mode controls are disabled while a run is in progress.
 
 ### Reasoning graph — explanation-first view
 
@@ -82,6 +98,8 @@ Given fact A  -->  Applied rule A => B  -->  Derived B  -->  Query B = TRUE
 The layout still uses the already-present **petgraph** library, with cycle-safe
 layering. It is computed once per query/run and reused on later UI frames.
 Runtime fact toggles regenerate the explanation with the new initial facts.
+The graph's Query selector lists only enabled runtime queries, since
+unselected queries are never evaluated or traced.
 
 On Ubuntu, eframe/rfd may require the usual desktop development packages,
 including `libgtk-3-dev`, `libxkbcommon-dev`, and `pkg-config`.
@@ -140,8 +158,9 @@ src/
     app.rs           workspace tabs, UI composition and controls
     document.rs      file loading, saving, and source text
     facts.rs         file-derived fact defaults and runtime overrides
+    queries.rs       file-derived query defaults and runtime overrides
     runner.rs        background solver execution
-    views.rs         scrolling editor, fact controls, and results
+    views.rs         scrolling editor, fact/query controls, and results
     graph/
       mod.rs         graph workspace exports
       model.rs       causal proof extraction from the engine trace
